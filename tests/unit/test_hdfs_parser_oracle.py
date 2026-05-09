@@ -24,8 +24,9 @@ from pipelinex.stages.parsing.hdfs_parser import HDFSParser
 from pipelinex.stages.parsing.hdfs_structured_csv_parser import HDFSStructuredCSVParser
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RAW_LOG = REPO_ROOT / "HDFS" / "HDFS_2k.log"
-STRUCT_CSV = REPO_ROOT / "HDFS" / "HDFS_2k.log_structured.csv"
+SAMPLE_DIR = REPO_ROOT / "data" / "HDFS_v1_sample"
+RAW_LOG = SAMPLE_DIR / "HDFS_2k.log"
+STRUCT_CSV = SAMPLE_DIR / "HDFS_2k.log_structured.csv"
 
 COVERAGE_THRESHOLD = 0.999  # 99.9% per the plan
 

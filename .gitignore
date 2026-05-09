@@ -48,6 +48,7 @@ data/HDFS/preprocessed/
 data/HDFS/*.zip
 data/BGL/BGL.log
 data/BGL/*.zip
+# data/HDFS_v1_sample/ is committed (small reference fixture for tests)
 
 # Trained models (regenerable)
 models/*.json

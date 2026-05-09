@@ -72,6 +72,17 @@ else
     fi
 fi
 
+# ----- HDFS 2k reference sample (used by oracle test) -----
+SAMPLE_DIR="$DATA_DIR/HDFS_v1_sample"
+mkdir -p "$SAMPLE_DIR"
+LOGHUB_RAW="https://raw.githubusercontent.com/logpai/loghub/master/HDFS"
+for f in HDFS_2k.log HDFS_2k.log_structured.csv HDFS_2k.log_templates.csv; do
+    if [[ ! -f "$SAMPLE_DIR/$f" ]]; then
+        say "fetching reference sample $f"
+        curl -sL --fail -o "$SAMPLE_DIR/$f" "$LOGHUB_RAW/$f"
+    fi
+done
+
 # ----- summary -----
 say "datasets ready"
 ls -lh "$HDFS_DIR" "$BGL_DIR" | grep -v '^total'

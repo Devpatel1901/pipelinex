@@ -63,8 +63,9 @@ class TestDetect:
 
 
 class TestDefaultFactory:
-    def test_default_includes_hdfs_parsers(self) -> None:
+    def test_default_includes_known_parsers(self) -> None:
         f = default_factory()
         kinds = f.known_kinds()
         assert "hdfs" in kinds
         assert "hdfs_structured_csv" in kinds
+        assert "bgl" in kinds

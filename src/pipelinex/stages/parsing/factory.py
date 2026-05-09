@@ -53,10 +53,12 @@ class ParserFactory:
 
 def default_factory() -> ParserFactory:
     """Return a ``ParserFactory`` with all built-in parsers registered."""
+    from pipelinex.stages.parsing.bgl_parser import BGLParser
     from pipelinex.stages.parsing.hdfs_parser import HDFSParser
     from pipelinex.stages.parsing.hdfs_structured_csv_parser import HDFSStructuredCSVParser
 
     f = ParserFactory()
     f.register("hdfs", HDFSParser)
     f.register("hdfs_structured_csv", HDFSStructuredCSVParser)
+    f.register("bgl", BGLParser)
     return f

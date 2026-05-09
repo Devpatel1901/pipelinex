@@ -204,7 +204,12 @@ class TestRealHDFSSample:
 
     @pytest.fixture
     def hdfs_sample(self) -> Path:
-        path = Path(__file__).resolve().parents[2] / "HDFS" / "HDFS_2k.log"
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "data"
+            / "HDFS_v1_sample"
+            / "HDFS_2k.log"
+        )
         if not path.exists():
             pytest.skip(f"HDFS_2k.log missing: {path}")
         return path
