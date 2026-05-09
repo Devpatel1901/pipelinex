@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+.tox/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasets (large, downloaded separately)
+data/HDFS/HDFS.log
+data/HDFS/anomaly_label.csv
+data/HDFS/preprocessed/
+data/HDFS/*.zip
+data/BGL/BGL.log
+data/BGL/*.zip
+
+# Trained models (regenerable)
+models/*.json
+models/*.pkl
+!models/.gitkeep
+
+# Benchmark results (regenerable)
+benchmarks/results/*.json
+benchmarks/results/*.png
+!benchmarks/results/.gitkeep
+
+# Temp / scratch
+tmp/
+scratch/
+*.log.tmp
+
+# Plan files
+PipelineX_Implementation_Plan.md
