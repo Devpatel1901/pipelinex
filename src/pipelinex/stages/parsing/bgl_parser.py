@@ -47,9 +47,12 @@ class BGLParser(IParser):
         return "bgl"
 
     def can_parse(self, raw: str) -> bool:
-        if not raw:
+        # Reject empty/whitespace-only inputs; .split() of "\r" or "  " is
+        # an empty list and would IndexError below.
+        parts = raw.split(maxsplit=1)
+        if not parts:
             return False
-        first = raw.split(maxsplit=1)[0]
+        first = parts[0]
         # Either '-' (normal) or an all-uppercase alert code.
         return first == "-" or (first.isupper() and first.isalpha())
 

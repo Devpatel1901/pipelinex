@@ -1,0 +1,45 @@
+# Run the full HDFS_v1 corpus through the pipeline with sequence-anomaly
+# detection. Designed for end-to-end demos against real labeled data.
+#
+# Override source.path, sequence_detector.model_path, and runtime.num_workers
+# from the CLI as needed.
+
+source:
+  kind: file
+  path: data/HDFS/HDFS.log
+
+parser:
+  kind: hdfs
+
+validation:
+  - kind: schema
+    require_message: true
+
+template_matcher:
+  enabled: true
+  templates_path: data/HDFS/preprocessed/HDFS.log_templates.csv
+
+sessionizer:
+  enabled: true
+  idle_window_s: 30.0
+  max_records_per_trace: 1000
+  max_open_traces: 50000
+  flush_interval_s: 5.0
+
+# Numeric detectors run inline. None enabled by default for this dataset
+# because HDFS anomalies are sequence-shaped, not numeric.
+detectors: []
+
+sequence_detector:
+  kind: sequence_ngram
+  model_path: models/hdfs_ngram_v1.json
+  threshold: 0.0
+
+repository:
+  kind: memory
+
+runtime:
+  num_workers: 4
+  queue_size: 1000
+  batch_size: 100
+  flush_interval_s: 1.0

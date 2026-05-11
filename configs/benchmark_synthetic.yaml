@@ -1,0 +1,28 @@
+# Benchmarking config — synthetic source feeds the pipeline at unbounded rate
+# into the in-memory repository. The throughput script overrides source.kind
+# at runtime to swap in SyntheticLogSource.
+
+source:
+  kind: iterable      # placeholder — benchmark script supplies the real source
+
+parser:
+  kind: hdfs
+
+validation: []
+
+template_matcher:
+  enabled: false
+
+sessionizer:
+  enabled: false
+
+detectors: []
+
+repository:
+  kind: memory
+
+runtime:
+  num_workers: 4
+  queue_size: 1000
+  batch_size: 200
+  flush_interval_s: 0.5

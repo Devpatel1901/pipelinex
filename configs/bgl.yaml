@@ -1,0 +1,48 @@
+# Run BGL through the pipeline with point-anomaly detectors. BGL events are
+# per-line labeled, so Z-Score/IQR/CUSUM each get a fair shot.
+
+source:
+  kind: file
+  path: data/BGL/BGL.log
+
+parser:
+  kind: bgl
+
+validation:
+  - kind: schema
+    require_message: true
+
+template_matcher:
+  enabled: false
+
+sessionizer:
+  enabled: false
+
+# Point detectors — a metric must be enrichment["metric"] for these to
+# fire. The evaluation script (Day 18) populates that field from binned
+# rates before invoking the detectors.
+detectors:
+  - kind: z_score
+    metric_key: metric
+    threshold: 3.0
+    window_size: 200
+    min_samples: 50
+  - kind: iqr
+    metric_key: metric
+    k: 1.5
+    window_size: 200
+    min_samples: 50
+  - kind: cusum
+    metric_key: metric
+    threshold: 5.0
+    slack: 0.5
+    warmup_samples: 50
+
+repository:
+  kind: memory
+
+runtime:
+  num_workers: 4
+  queue_size: 1000
+  batch_size: 100
+  flush_interval_s: 1.0

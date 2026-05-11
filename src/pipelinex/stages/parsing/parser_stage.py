@@ -34,8 +34,13 @@ class ParserStage(IPipelineStage):
         except ParserError as e:
             raise FatalStageError(f"{self._parser.name} failed to parse: {e}") from e
 
-        # Preserve identity & pipeline metadata from the input record.
+        # Preserve identity & pipeline metadata from the input record, and
+        # carry forward any enrichment that earlier stages added (e.g. an
+        # ingest-time stamp). Parser-supplied enrichment wins on conflict —
+        # the parser is the authority on fields it extracts (block_id, etc.).
         parsed.id = record.id
         parsed.pipeline_run_id = record.pipeline_run_id
         parsed.stage_history = list(record.stage_history)
+        for k, v in record.enrichment.items():
+            parsed.enrichment.setdefault(k, v)
         return parsed
