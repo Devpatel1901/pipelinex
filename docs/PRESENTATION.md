@@ -31,16 +31,17 @@ explainer. Your job is to make the room understand, not to recite bullets.
 | 2 | Agenda — what I'll cover | 1 |
 | 3 | Problem statement | 3 |
 | 4 | Architecture diagram | 4 |
-| 5 | Example trace — HDFS & BGL through every stage | 4 |
-| 6 | Concurrency engine | 3 |
-| 7 | Error classification & graceful shutdown | 2 |
-| 8 | **Sessionizer & sequence detector — deep dive** | 5 |
-| 9 | Design patterns — problem → pattern mapping | 3 |
-| 10 | Results — HDFS sequence detection | 2 |
-| 11 | Results — BGL point detection + throughput | 2 |
-| 12 | Summary | 1 |
-| 13 | Thank you / Q&A | — |
-| | **Total** | **32** |
+| 5 | **Config → Pipeline** (YAML to built pipeline, two examples) | 3 |
+| 6 | Example trace — HDFS & BGL through every stage | 4 |
+| 7 | Concurrency engine | 3 |
+| 8 | Error classification & graceful shutdown | 2 |
+| 9 | **Sessionizer & sequence detector — deep dive** | 5 |
+| 10 | Design patterns — problem → pattern mapping | 3 |
+| 11 | Results — HDFS sequence detection | 2 |
+| 12 | Results — BGL point detection + throughput | 2 |
+| 13 | Summary | 1 |
+| 14 | Thank you / Q&A | — |
+| | **Total** | **35** |
 
 ---
 
@@ -82,25 +83,27 @@ explainer. Your job is to make the room understand, not to recite bullets.
 >
 > 1. **Problem statement** — why log analytics is hard
 > 2. **Architecture** — the system at a glance
-> 3. **Example trace** — one HDFS line and one BGL line through every stage
-> 4. **Concurrency engine** — how the async pipeline actually runs
-> 5. **Error classification & graceful shutdown**
-> 6. **Sessionizer & sequence detector** — the deep dive
-> 7. **Design patterns** — problem → pattern mapping
-> 8. **Results** — HDFS sequence detection, BGL point detection, throughput
-> 9. **Summary**
+> 3. **Config → Pipeline** — how YAML becomes a running pipeline
+> 4. **Example trace** — one HDFS line and one BGL line through every stage
+> 5. **Concurrency engine** — how the async pipeline actually runs
+> 6. **Error classification & graceful shutdown**
+> 7. **Sessionizer & sequence detector** — the deep dive
+> 8. **Design patterns** — problem → pattern mapping
+> 9. **Results** — HDFS sequence detection, BGL point detection, throughput
+> 10. **Summary**
 
 **[SAY] (~1 minute):**
 > Here's how I'd like to structure this. I'll start with the problem
 > statement — what makes log analytics hard at scale. Then the architecture,
-> at a high level. To make that architecture concrete, I'll walk one HDFS
-> line and one BGL line through every single stage of the pipeline. From
-> there I'll go deeper on the concurrency engine, and on how I handle errors
-> and shutdown. The piece I'm most proud of is the sessionizer paired with
-> the sequence detector, so I'll spend a few extra minutes on those
-> together. After that, I'll show how the design patterns I chose map to
-> specific problems. Then results, then a short summary, then your
-> questions.
+> at a high level. After that I'll show how a YAML config becomes a running
+> pipeline — two real config files, two real pipeline layouts side by side.
+> To make that concrete, I'll walk one HDFS line and one BGL line through
+> every single stage. From there I'll go deeper on the concurrency engine,
+> and on how I handle errors and shutdown. The piece I'm most proud of is
+> the sessionizer paired with the sequence detector, so I'll spend a few
+> extra minutes on those together. After that, I'll show how the design
+> patterns I chose map to specific problems. Then results, then a short
+> summary, then your questions.
 
 **[NOTES]**
 - Quick slide. Don't dwell. The agenda's job is to set expectations and
@@ -232,7 +235,181 @@ explainer. Your job is to make the room understand, not to recite bullets.
 
 ---
 
-# Slide 5 — Example Trace: HDFS and BGL through the Pipeline
+# Slide 5 — Config → Pipeline (YAML to Built Pipeline)
+
+> *Two YAML files on the left, the resulting pipeline layout on the right,
+> and the builder code snippet at the bottom. No prose on the slide — let
+> the diagram speak.*
+
+---
+
+### Side-by-side: `hdfs_v1.yaml` → HDFS pipeline
+
+```
+┌─────────────────────────────────────┐         ┌────────────────────────────────────────────────┐
+│   configs/hdfs_v1.yaml              │         │   Built pipeline layout                        │
+│                                     │         │                                                │
+│   source:                           │         │                                                │
+│     kind: file                      │ ──────▶ │   FileLogSource(path="data/HDFS/HDFS.log")     │
+│     path: data/HDFS/HDFS.log        │         │                                                │
+│                                     │         │              │                                 │
+│   parser:                           │         │              ▼                                 │
+│     kind: hdfs                      │ ──────▶ │   HDFSParser  (regex + block_id extraction)    │
+│                                     │         │                                                │
+│   validation:                       │         │              │                                 │
+│     - kind: schema                  │ ──────▶ │              ▼                                 │
+│       require_message: true         │         │   ValidationChain([SchemaValidator])           │
+│                                     │         │                                                │
+│   template_matcher:                 │         │              │                                 │
+│     enabled: true                   │ ──────▶ │              ▼                                 │
+│     templates_path: ...templates.csv│         │   TemplateMatcherStage (29 templates loaded)   │
+│                                     │         │                                                │
+│   sessionizer:                      │         │              │                                 │
+│     enabled: true                   │ ──────▶ │              ▼                                 │
+│     idle_window_s: 30.0             │         │   BlockSessionizerStage                        │
+│     max_open_traces: 50000          │         │     (janitor every 5s, 30s idle window,        │
+│     flush_interval_s: 5.0           │         │      LRU at 50K open traces)                   │
+│                                     │         │                                                │
+│   detectors: []     # none inline   │         │              │ records continue                │
+│                                     │         │              ▼                                 │
+│   sequence_detector:                │         │   InMemoryLogRepository (batch=100)            │
+│     kind: sequence_ngram            │         │                                                │
+│     model_path: models/...json      │ ──────▶ │   EventBus  ──▶  SequenceAnomalyDetector       │
+│     threshold: 0.0                  │         │                  (subscribes to                │
+│                                     │         │                   BlockTraceClosed)            │
+│   repository: { kind: memory }      │ ──────▶ │                                                │
+│                                     │         │                                                │
+│   runtime:                          │         │   PipelineExecutor                             │
+│     num_workers: 4                  │ ──────▶ │     workers=4, queue_size=1000,                │
+│     queue_size: 1000                │         │     batch_size=100                             │
+│     batch_size: 100                 │         │                                                │
+└─────────────────────────────────────┘         └────────────────────────────────────────────────┘
+```
+
+---
+
+### Side-by-side: `bgl.yaml` → BGL pipeline
+
+```
+┌─────────────────────────────────────┐         ┌────────────────────────────────────────────────┐
+│   configs/bgl.yaml                  │         │   Built pipeline layout                        │
+│                                     │         │                                                │
+│   source:                           │         │                                                │
+│     kind: file                      │ ──────▶ │   FileLogSource(path="data/BGL/BGL.log")       │
+│     path: data/BGL/BGL.log          │         │                                                │
+│                                     │         │              │                                 │
+│   parser:                           │         │              ▼                                 │
+│     kind: bgl                       │ ──────▶ │   BGLParser  (str.split, label = field[0])     │
+│                                     │         │                                                │
+│   validation:                       │         │              │                                 │
+│     - kind: schema                  │ ──────▶ │              ▼                                 │
+│       require_message: true         │         │   ValidationChain([SchemaValidator])           │
+│                                     │         │                                                │
+│   template_matcher:                 │         │                                                │
+│     enabled: false                  │ ──────▶ │   (no template matcher — skipped)              │
+│                                     │         │                                                │
+│   sessionizer:                      │         │                                                │
+│     enabled: false                  │ ──────▶ │   (no sessionizer — BGL is point anomalies)    │
+│                                     │         │                                                │
+│   detectors:                        │         │              │                                 │
+│     - kind: z_score                 │         │              ▼                                 │
+│       threshold: 3.0                │ ──────▶ │   DetectorStage([                              │
+│       window_size: 200              │         │     ZScoreDetector(threshold=3.0, win=200),    │
+│     - kind: iqr                     │ ──────▶ │     IQRDetector(k=1.5, win=200),               │
+│       k: 1.5                        │         │     CUSUMDetector(threshold=5.0, slack=0.5)    │
+│     - kind: cusum                   │ ──────▶ │   ])                                           │
+│       threshold: 5.0                │         │                                                │
+│       slack: 0.5                    │         │              │                                 │
+│                                     │         │              ▼                                 │
+│   repository: { kind: memory }      │ ──────▶ │   InMemoryLogRepository (batch=100)            │
+│                                     │         │                                                │
+│   runtime:                          │         │   PipelineExecutor                             │
+│     num_workers: 4                  │ ──────▶ │     workers=4, queue_size=1000,                │
+│     queue_size: 1000                │         │     batch_size=100                             │
+│     batch_size: 100                 │         │                                                │
+└─────────────────────────────────────┘         └────────────────────────────────────────────────┘
+```
+
+---
+
+### The builder — one function, both pipelines
+
+```python
+# src/pipelinex/core/builder.py
+
+def build_pipeline(config: PipelineConfig) -> BuiltPipeline:
+    source     = make_source(config.source)               # YAML "kind" → ILogSource
+    parser     = make_parser(config.parser.kind)          # YAML "kind" → IParser
+    validators = [make_validator(v) for v in config.validation]
+    stages     = [ParserStage(parser), ValidationChain(validators)]
+
+    if config.template_matcher.enabled:
+        stages.append(TemplateMatcherStage(config.template_matcher.templates_path))
+
+    sessionizer = None
+    if config.sessionizer.enabled:
+        sessionizer = BlockSessionizerStage(**config.sessionizer.model_dump())
+        stages.append(sessionizer)
+
+    detectors = [make_detector(d) for d in config.detectors]
+    if detectors:
+        stages.append(DetectorStage(detectors))
+
+    repository = make_repository(config.repository)
+    bus        = EventBus()
+
+    sequence_detector = None
+    if config.sequence_detector:
+        sequence_detector = make_sequence_detector(config.sequence_detector)
+        bus.subscribe(BlockTraceClosed, sequence_detector)   # ◀── HDFS-only wiring
+
+    executor = PipelineExecutor(
+        source=source, stages=stages, repository=repository, bus=bus,
+        workers=config.runtime.num_workers,
+        queue_size=config.runtime.queue_size,
+        batch_size=config.runtime.batch_size,
+    )
+    return BuiltPipeline(executor, repository, bus, sessionizer, sequence_detector)
+```
+
+> **Same builder. Same code path. Two completely different pipelines.**
+
+**[SAY] (~3 minutes):**
+> Before I trace one log line through the system, I want to show how the
+> *system itself* gets assembled from configuration. This is what makes
+> "extensible" a literal property rather than a slogan.
+>
+> On the left of each row is a real YAML file from the repo — `hdfs_v1.yaml`
+> on top, `bgl.yaml` on the bottom. On the right is the pipeline layout the
+> builder produces from each file. The arrows show which YAML block maps to
+> which constructed component.
+>
+> Look at the differences. The HDFS pipeline turns on the template matcher,
+> turns on the sessionizer with a 30-second idle window, and wires a
+> sequence detector to the event bus — because HDFS anomalies are
+> sequence-shaped. The BGL pipeline turns off the template matcher, turns
+> off the sessionizer, and instead instantiates three inline point detectors
+> — Z-Score, IQR, and CUSUM — because BGL anomalies are per-line and numeric.
+>
+> The builder code at the bottom is what makes this work. About fifty lines.
+> It reads the validated Pydantic config, calls a factory for each component,
+> conditionally adds stages based on the `enabled` flags, and wires the
+> event bus subscription only when a sequence detector is configured. The
+> *exact same function* produces both pipelines from the two different YAML
+> files. No HDFS-specific code path, no BGL-specific code path — just
+> configuration driving construction.
+
+**[NOTES]**
+- This slide proves the extensibility claim before you make it again on
+  the patterns slide.
+- If asked "what happens if I misspell `idle_window_s`?" — Pydantic's
+  `extra="forbid"` rejects the config at load time with a clear error.
+- If asked "how big is the builder?" — about 220 lines total including
+  factory imports and the `BuiltPipeline` dataclass.
+
+---
+
+# Slide 6 — Example Trace: HDFS and BGL through the Pipeline
 
 > *This is a two-part slide. Show HDFS first, then BGL. If your slide tool
 > allows builds/animations, reveal each stage one at a time as you speak.*
@@ -483,7 +660,7 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 6 — Concurrency Engine
+# Slide 7 — Concurrency Engine
 
 **Visual:**
 
@@ -560,7 +737,7 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 7 — Error Classification & Graceful Shutdown
+# Slide 8 — Error Classification & Graceful Shutdown
 
 **Visual:**
 
@@ -618,7 +795,7 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 8 — Sessionizer & Sequence Detector — Deep Dive
+# Slide 9 — Sessionizer & Sequence Detector — Deep Dive
 
 > *This is the deepest technical slide of the talk. Plan for ~5 minutes.
 > Two halves: how the sessionizer builds a trace, then how the sequence
@@ -794,7 +971,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 9 — Design Patterns: Problem → Pattern
+# Slide 10 — Design Patterns: Problem → Pattern
 
 **Visual:**
 
@@ -863,7 +1040,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 10 — Results: HDFS Sequence Detection
+# Slide 11 — Results: HDFS Sequence Detection
 
 **Visual:**
 
@@ -917,7 +1094,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 11 — Results: BGL Point Detection + Throughput
+# Slide 12 — Results: BGL Point Detection + Throughput
 
 **Visual:**
 
@@ -977,7 +1154,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 12 — Summary
+# Slide 13 — Summary
 
 **Visual:**
 
@@ -1015,7 +1192,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 13 — Thank You & Q&A
+# Slide 14 — Thank You & Q&A
 
 **Visual:**
 
