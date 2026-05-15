@@ -35,6 +35,7 @@ from _eval_common import confusion, format_table
 
 from pipelinex.core.models import LogRecord
 from pipelinex.detectors.cusum import CUSUMDetector
+from pipelinex.detectors.feature_window import FeatureWindowDetector
 from pipelinex.detectors.iqr import IQRDetector
 from pipelinex.detectors.zscore import ZScoreDetector
 from pipelinex.stages.parsing.bgl_parser import BGLParser
@@ -114,10 +115,39 @@ async def amain() -> int:
             }
         )
 
+    # --- feature_window: a per-line detector that needs the raw record
+    # stream, not the aggregated rate stream. Do a second pass over the
+    # log to feed it record-by-record. Slightly more I/O but keeps the
+    # existing 3-detector loop unchanged.
+    print("[2b/3] running feature_window over per-line stream")
+    fw_predicted, fw_actual, fw_universe = await _eval_feature_window(
+        log_path=args.log,
+        window_seconds=args.window_seconds,
+        max_lines=args.max_lines,
+    )
+    fw_cm = confusion(
+        predicted={str(t.timestamp()) for t in fw_predicted},
+        actual={str(t.timestamp()) for t in fw_actual},
+        universe={str(t.timestamp()) for t in fw_universe},
+    )
+    detector_results["feature_window"] = fw_cm.as_dict()
+    rows.append(
+        {
+            "detector": "feature_window",
+            "windows": len(fw_universe),
+            "TP": fw_cm.tp,
+            "FP": fw_cm.fp,
+            "FN": fw_cm.fn,
+            "precision": f"{fw_cm.precision:.4f}",
+            "recall": f"{fw_cm.recall:.4f}",
+            "F1": f"{fw_cm.f1:.4f}",
+        }
+    )
+
     print("\n=== BGL — point-anomaly evaluation ===")
     for r in rows:
         print(
-            f"  {r['detector']:>8s}  TP={r['TP']:>5}  FP={r['FP']:>5}  "
+            f"  {r['detector']:>14s}  TP={r['TP']:>5}  FP={r['FP']:>5}  "
             f"FN={r['FN']:>5}  precision={r['precision']}  "
             f"recall={r['recall']}  F1={r['F1']}"
         )
@@ -133,6 +163,95 @@ async def amain() -> int:
     (RESULTS_DIR / "bgl_eval.json").write_text(json.dumps(out, indent=2))
     _update_benchmarks_md(rows, args.window_seconds)
     return 0
+
+
+async def _eval_feature_window(
+    log_path: Path,
+    window_seconds: int,
+    max_lines: int | None,
+) -> tuple[set[datetime], set[datetime], set[datetime]]:
+    """Run FeatureWindowDetector over the per-line BGL stream.
+
+    Returns ``(predicted_windows, actual_windows, universe)`` keyed by
+    the same bucket-start ``datetime`` the rate-stream loop uses, so the
+    confusion matrix is comparable across detectors.
+    """
+    parser = BGLParser()
+    det = FeatureWindowDetector(
+        window_seconds=window_seconds,
+        feature_history=200,
+        iqr_k=1.5,
+        min_samples=50,
+    )
+    universe: set[datetime] = set()
+    actual: set[datetime] = set()
+    predicted: set[datetime] = set()
+    bucket_for_record: dict = {}
+    n_skipped = 0
+    start = time.perf_counter()
+    with log_path.open(encoding="utf-8", errors="replace") as fh:
+        for i, raw in enumerate(fh):
+            if max_lines is not None and i >= max_lines:
+                break
+            raw = raw.rstrip("\n")
+            if not raw:
+                continue
+            try:
+                rec = parser.parse(raw)
+            except Exception:
+                n_skipped += 1
+                continue
+            ts = rec.timestamp
+            if ts is None:
+                continue
+            bucket = _bucket(ts, window_seconds)
+            universe.add(bucket)
+            label = rec.enrichment.get("bgl_label")
+            if isinstance(label, str) and label != "-":
+                actual.add(bucket)
+            bucket_for_record[rec.id] = bucket
+            anomaly = await det.detect(rec)
+            if anomaly is not None:
+                # The detector anchors the anomaly to the first record of
+                # the *closed* (prior) window — recover that window's
+                # bucket via metadata.window_start.
+                ws = anomaly.metadata.get("window_start")
+                if isinstance(ws, str):
+                    predicted.add(_parse_window_start(ws))
+            if (i + 1) % 1_000_000 == 0:
+                rate = (i + 1) / (time.perf_counter() - start)
+                print(f"      {i + 1:>10,} lines  ({rate:>10,.0f} lines/s)")
+    final = det.flush()
+    if final is not None:
+        ws = final.metadata.get("window_start")
+        if isinstance(ws, str):
+            predicted.add(_parse_window_start(ws))
+    print(f"      feature_window done; skipped {n_skipped:,} unparseable lines")
+    return predicted, actual, universe
+
+
+def _bucket(ts: datetime, window_seconds: int) -> datetime:
+    """Match the bucketing used by ``_aggregate`` for cross-detector parity.
+
+    Note: this is field-level truncation. For the default ``window_seconds=60``
+    (and any minute-aligned size) it agrees with the detector's internal
+    epoch-second flooring, so predicted and actual windows are
+    comparable. Sub-minute windows would diverge — out of scope here.
+    """
+    window = ts.replace(
+        second=(ts.second // window_seconds) * window_seconds,
+        microsecond=0,
+    )
+    if window_seconds >= 60:
+        window = window.replace(second=0)
+        window = window.replace(
+            minute=(ts.minute // (window_seconds // 60)) * (window_seconds // 60)
+        )
+    return window
+
+
+def _parse_window_start(iso: str) -> datetime:
+    return datetime.fromisoformat(iso)
 
 
 def _aggregate(

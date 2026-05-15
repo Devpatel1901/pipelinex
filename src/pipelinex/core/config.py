@@ -77,11 +77,17 @@ class ValidatorConfig(BaseModel):
 class DetectorConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
     kind: str
-    metric_key: str = "metric"
+    # Optional so the builder doesn't pass it as a kwarg unless the user
+    # explicitly set it — some detectors (e.g. feature_window) don't take a
+    # metric_key at all.
+    metric_key: str | None = None
 
 
 class SequenceDetectorConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # extra="allow" so new sequence detectors (e.g. sequence_loglikelihood
+    # with its alpha smoothing constant) can pass through detector-specific
+    # kwargs without forcing a schema change on every new strategy.
+    model_config = ConfigDict(extra="allow")
     kind: str = "sequence_ngram"
     model_path: str | None = None
     threshold: float = 0.0

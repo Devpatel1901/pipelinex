@@ -37,6 +37,15 @@ detectors:
     threshold: 5.0
     slack: 0.5
     warmup_samples: 50
+  # Multi-feature window detector — consumes the raw record stream
+  # (not the binned rate) and scores rate + distinct_components +
+  # severity_warn_ratio + template_entropy against per-feature IQR fences.
+  - kind: feature_window
+    window_seconds: 60
+    feature_history: 200
+    iqr_k: 1.5
+    min_samples: 50
+    features: [rate, distinct_components, severity_warn_ratio, template_entropy]
 
 repository:
   kind: memory

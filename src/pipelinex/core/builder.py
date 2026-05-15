@@ -31,6 +31,10 @@ from pipelinex.core.sources import FileLogSource, IterableLogSource, StdinLogSou
 from pipelinex.detectors.detector_stage import DetectorStage
 from pipelinex.detectors.factory import default_factory as default_detector_factory
 from pipelinex.detectors.sequence import SequenceAnomalyDetector, SequenceModel
+from pipelinex.detectors.sequence_loglikelihood import (
+    SequenceLogLikelihoodDetector,
+    SequenceStatsModel,
+)
 from pipelinex.events.bus import EventBus
 from pipelinex.events.events import BlockTraceClosed
 from pipelinex.persistence.memory_repo import InMemoryLogRepository
@@ -183,7 +187,14 @@ def _build_detector_stages(
     factory = default_detector_factory()
     stages: list[IPipelineStage] = []
     for dc in config.detectors:
-        kwargs = dc.model_dump(exclude={"kind"})
+        # Drop `None` kwargs so detectors that don't take a parameter
+        # (e.g. feature_window has no metric_key) aren't fed it. Concrete
+        # detectors keep their own default values for omitted fields.
+        kwargs = {
+            k: v
+            for k, v in dc.model_dump(exclude={"kind"}).items()
+            if v is not None
+        }
         detector: IAnomalyDetector = factory.create_numeric(dc.kind, **kwargs)
         stages.append(DetectorStage(detector, repository))
     return stages
@@ -198,11 +209,20 @@ def _build_sequence_detector(
         return None
     sd_cfg = config.sequence_detector
     factory = default_detector_factory()
-    detector = factory.create_sequence(sd_cfg.kind, threshold=sd_cfg.threshold)
+    # Forward detector-specific kwargs (e.g. `alpha` for loglikelihood) by
+    # pulling them out of the model_extra bucket (extra="allow" on the schema).
+    extra_kwargs = dict(sd_cfg.model_extra or {})
+    extra_kwargs.pop("model_path", None)  # consumed below, not passed to ctor
+    detector = factory.create_sequence(
+        sd_cfg.kind, threshold=sd_cfg.threshold, **extra_kwargs
+    )
 
-    if isinstance(detector, SequenceAnomalyDetector) and sd_cfg.model_path:
+    if sd_cfg.model_path:
         try:
-            detector.set_model(SequenceModel.load(sd_cfg.model_path))
+            if isinstance(detector, SequenceAnomalyDetector):
+                detector.set_model(SequenceModel.load(sd_cfg.model_path))
+            elif isinstance(detector, SequenceLogLikelihoodDetector):
+                detector.set_model(SequenceStatsModel.load(sd_cfg.model_path))
         except (FileNotFoundError, OSError) as e:
             logger.warning(
                 "sequence model not available at %s (%s); detector starts empty",

@@ -35,6 +35,18 @@ sequence_detector:
   model_path: models/hdfs_ngram_v1.json
   threshold: 0.0
 
+# To swap in the statistical likelihood detector (better recall), replace
+# the block above with:
+#
+#   sequence_detector:
+#     kind: sequence_loglikelihood
+#     model_path: models/hdfs_ngram_stats_v1.json
+#     threshold: -5.0   # mean log-prob cutoff; lower = more anomalous
+#     alpha: 0.1        # Laplace smoothing
+#
+# That's the entire change. The pipeline picks up the new strategy through
+# the DetectorFactory; no code changes anywhere else.
+
 repository:
   kind: memory
 

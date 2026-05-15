@@ -64,13 +64,19 @@ class DetectorFactory:
 def default_factory() -> DetectorFactory:
     """Return a DetectorFactory with all built-in detectors registered."""
     from pipelinex.detectors.cusum import CUSUMDetector
+    from pipelinex.detectors.feature_window import FeatureWindowDetector
     from pipelinex.detectors.iqr import IQRDetector
     from pipelinex.detectors.sequence import SequenceAnomalyDetector
+    from pipelinex.detectors.sequence_loglikelihood import (
+        SequenceLogLikelihoodDetector,
+    )
     from pipelinex.detectors.zscore import ZScoreDetector
 
     f = DetectorFactory()
     f.register_numeric("z_score", ZScoreDetector)
     f.register_numeric("iqr", IQRDetector)
     f.register_numeric("cusum", CUSUMDetector)
+    f.register_numeric("feature_window", FeatureWindowDetector)
     f.register_sequence("sequence_ngram", SequenceAnomalyDetector)
+    f.register_sequence("sequence_loglikelihood", SequenceLogLikelihoodDetector)
     return f
