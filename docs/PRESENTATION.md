@@ -19,7 +19,7 @@ Each section below is **one slide**. The structure is:
 Speak the **[SAY]** lines naturally — don't read. The slide is for the panel; you're the
 explainer. Your job is to make the room understand, not to recite bullets.
 
-**Total slide count:** 13 slides over ~30 minutes.
+**Total slide count:** 14 slides over ~33 minutes.
 
 ---
 
@@ -31,17 +31,18 @@ explainer. Your job is to make the room understand, not to recite bullets.
 | 2 | Agenda — what I'll cover | 1 |
 | 3 | Problem statement | 3 |
 | 4 | Architecture diagram | 4 |
-| 5 | **Config → Pipeline** (YAML to built pipeline, two examples) | 3 |
-| 6 | Example trace — HDFS & BGL through every stage | 4 |
-| 7 | Concurrency engine | 3 |
-| 8 | Error classification & graceful shutdown | 2 |
-| 9 | **Sessionizer & sequence detector — deep dive** | 5 |
-| 10 | Design patterns — problem → pattern mapping | 3 |
-| 11 | Results — HDFS sequence detection | 2 |
-| 12 | Results — BGL point detection + throughput | 2 |
-| 13 | Summary | 1 |
-| 14 | Thank you / Q&A | — |
-| | **Total** | **35** |
+| 5 | **Datasets — HDFS & BGL schemas + anomaly shapes** | 3 |
+| 6 | **Config → Pipeline** (YAML to built pipeline, two examples) | 3 |
+| 7 | Example trace — HDFS & BGL through every stage | 4 |
+| 8 | Concurrency engine | 3 |
+| 9 | Error classification & graceful shutdown | 2 |
+| 10 | **Sessionizer & sequence detector — deep dive** | 5 |
+| 11 | Design patterns — problem → pattern mapping | 3 |
+| 12 | Results — HDFS sequence detection | 2 |
+| 13 | Results — BGL point detection + throughput | 2 |
+| 14 | Summary | 1 |
+| 15 | Thank you / Q&A | — |
+| | **Total** | **38** |
 
 ---
 
@@ -83,25 +84,29 @@ explainer. Your job is to make the room understand, not to recite bullets.
 >
 > 1. **Problem statement** — why log analytics is hard
 > 2. **Architecture** — the system at a glance
-> 3. **Config → Pipeline** — how YAML becomes a running pipeline
-> 4. **Example trace** — one HDFS line and one BGL line through every stage
-> 5. **Concurrency engine** — how the async pipeline actually runs
-> 6. **Error classification & graceful shutdown**
-> 7. **Sessionizer & sequence detector** — the deep dive
-> 8. **Design patterns** — problem → pattern mapping
-> 9. **Results** — HDFS sequence detection, BGL point detection, throughput
-> 10. **Summary**
+> 3. **Datasets** — HDFS & BGL schemas and the shape of their anomalies
+> 4. **Config → Pipeline** — how YAML becomes a running pipeline
+> 5. **Example trace** — one HDFS line and one BGL line through every stage
+> 6. **Concurrency engine** — how the async pipeline actually runs
+> 7. **Error classification & graceful shutdown**
+> 8. **Sessionizer & sequence detector** — the deep dive
+> 9. **Design patterns** — problem → pattern mapping
+> 10. **Results** — HDFS sequence detection, BGL point detection, throughput
+> 11. **Summary**
 
 **[SAY] (~1 minute):**
 > Here's how I'd like to structure this. I'll start with the problem
 > statement — what makes log analytics hard at scale. Then the architecture,
-> at a high level. After that I'll show how a YAML config becomes a running
-> pipeline — two real config files, two real pipeline layouts side by side.
-> To make that concrete, I'll walk one HDFS line and one BGL line through
-> every single stage. From there I'll go deeper on the concurrency engine,
-> and on how I handle errors and shutdown. The piece I'm most proud of is
-> the sessionizer paired with the sequence detector, so I'll spend a few
-> extra minutes on those together. After that, I'll show how the design
+> at a high level. Before going into the implementation, I'll spend a few
+> minutes on the two real datasets I evaluated against — HDFS and BGL —
+> because the *shape* of their anomalies is what drives every design choice
+> in the rest of the talk. After that I'll show how a YAML config becomes a
+> running pipeline — two real config files, two real pipeline layouts side
+> by side. To make that concrete, I'll walk one HDFS line and one BGL line
+> through every single stage. From there I'll go deeper on the concurrency
+> engine, and on how I handle errors and shutdown. The piece I'm most proud
+> of is the sessionizer paired with the sequence detector, so I'll spend a
+> few extra minutes on those together. After that, I'll show how the design
 > patterns I chose map to specific problems. Then results, then a short
 > summary, then your questions.
 
@@ -235,7 +240,238 @@ explainer. Your job is to make the room understand, not to recite bullets.
 
 ---
 
-# Slide 5 — Config → Pipeline (YAML to Built Pipeline)
+# Slide 5 — Datasets: HDFS & BGL — Schemas and Anomaly Shapes
+
+> *Before going into config and code, the panel needs to know what the data
+> actually looks like and what an "anomaly" actually means in each dataset.
+> This slide is the foundation that every later slide builds on.*
+
+---
+
+### Why these two datasets
+
+> | | **HDFS_v1** | **BGL** |
+> |---|---|---|
+> | **System** | Hadoop Distributed File System | IBM Blue Gene/L supercomputer |
+> | **Source** | Private cloud, MapReduce benchmark workload | Lawrence Livermore National Lab — 131,072 CPUs, 32,768 GB RAM |
+> | **Released by** | Loghub (Zhu et al., ISSRE 2023) — academic standard for log-analytics benchmarks | Same — original paper Oliner & Stearley, DSN 2007 |
+> | **Size in repo** | 11.17 M lines, ~1.5 GB | 4.75 M lines, ~700 MB |
+> | **Labeling granularity** | Per **block** — one label per `block_id` | Per **line** — first column of each line |
+> | **Anomaly shape** | **Sequence** — the *pattern* of events on a block is wrong | **Point** — individual line is itself anomalous |
+> | **What it stresses in PipelineX** | Sessionizer + sequence detector | Per-line parsing + point detectors |
+
+> **The whole point of using both:** they're *orthogonal* anomaly models.
+> One pipeline framework, two different mathematics. If the same architecture
+> handles both, the extensibility claim is real.
+
+---
+
+### HDFS — schema and anomaly shape
+
+**Raw line format:**
+```
+081109 203518 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-1608999687919862906 src: /10.250.19.102:54106 dest: /10.250.19.102:50010
+└─┬──┘ └─┬──┘ └┬┘ └─┬┘ └─────────┬─────────┘  └──────────────────────────┬──────────────────────────────────────────┘
+ date   time  pid  level     component                                content (free-form, contains block_id)
+```
+
+**The key field is `block_id`** (`blk_-1608999687919862906`). HDFS doesn't
+label individual *lines* — it labels entire *blocks*. Each block is a
+multi-line lifecycle: allocate → receive on replica 1 → receive on
+replica 2 → receive on replica 3 → confirm → serve → delete. Loghub
+provides:
+
+> | Preprocessed artifact | What it contains |
+> |---|---|
+> | `HDFS.log_templates.csv` | **29 event templates** (E1–E29). Each raw line matches exactly one. E.g. `E5 = "Receiving block [*] src: [*] dest: [*]"`, `E11 = "PacketResponder [*] for block [*] terminating"` |
+> | `anomaly_label.csv` | One row per block: `(block_id, Normal | Anomaly)` |
+> | `Event_traces.csv` | The pre-computed event sequence per block, used as a sanity reference for my sessionizer |
+
+**The numbers — labeled ground truth:**
+
+> | | count | % |
+> |---|---:|---:|
+> | Total blocks | **575,061** | 100.0% |
+> | Normal | 558,223 | 97.07% |
+> | **Anomaly** | **16,838** | **2.93%** |
+
+**What an HDFS anomaly looks like — three real examples from the corpus:**
+
+> | Anomaly pattern | What goes wrong | Why a regex can't catch it |
+> |---|---|---|
+> | **Write never completed** | `allocateBlock` fires, replicas start receiving, then no `Received block ... of size` confirmation | Every individual line is *normal*. Anomaly is the *absent* terminal event. |
+> | **Replication failed mid-flight** | `Receiving block` on 3 nodes, exception on one, the surviving replicas re-replicate → unusual ordering | Every line matches a known template. Anomaly is the unusual *sequence* of templates. |
+> | **Block deleted that wasn't fully stored** | `Deleting block` before `addStoredBlock` for that replica | Each line in isolation is benign; only the relative *order* is wrong. |
+
+> **The single takeaway:** no per-line anomaly label exists in HDFS *because
+> no single line is anomalous*. The anomaly is a property of the **sequence
+> of events on one block**. That's why HDFS forces sessionization, and why
+> the sequence detector exists.
+
+---
+
+### BGL — schema and anomaly shape
+
+**Raw line format (whitespace-separated, free-form tail):**
+```
+KERNDTLB 1117838611 2005.06.03 R23-M1-N6-I:J18-U01 2005-06-03-15.43.31.041218 R23-M1-N6-I:J18-U01 RAS KERNEL FATAL data TLB error interrupt
+└──┬───┘ └──┬─────┘ └───┬────┘ └───────┬──────────┘ └──────────┬───────────┘ └─────┬──────────┘ └┬┘ └──┬─┘ └─┬──┘ └──────────┬──────────┘
+ label   epoch ts    date       node loc (rack/midplane/    full timestamp    node (repeat)   type  comp  level    content (free-form)
+                                  node/card/chip/CPU)
+```
+
+**The key field is the *first column*** — the **per-line ground-truth
+label**. `-` means a normal line. Anything else is an alert category code
+identifying *what kind* of anomaly that single line is.
+
+**The numbers — labeled ground truth (this codebase, this file):**
+
+> | Label | count | meaning |
+> |---|---:|---|
+> | `-` | 4,399,503 | normal |
+> | `KERNDTLB` | 152,734 | kernel data TLB (translation lookaside buffer) error |
+> | `KERNSTOR` | 63,491 | kernel storage error |
+> | `APPSEV` | 49,651 | application severe failure |
+> | `KERNMNTF` | 31,531 | kernel monitor / fatal |
+> | `KERNTERM` | 23,338 | kernel termination |
+> | `KERNREC` | 6,145 | kernel recovery |
+> | `APPREAD` | 5,983 | application read failure (`ciod: failed to read message prefix on control stream`) |
+> | … 30+ more codes … | | (link, microcode, power, etc.) |
+> | **Total anomalous** | **~348,000** | **~7.3% of lines** |
+
+**What a BGL anomaly looks like — one real example:**
+
+```
+APPREAD 1117869872 2005.06.04 R23-M1-N8-I:J18-U11 2005-06-04-00.24.32.398284
+        R23-M1-N8-I:J18-U11 RAS APP FATAL
+        ciod: failed to read message prefix on control stream
+        (CioStream socket to 172.16.96.116:33399
+```
+
+That single line, in isolation, **is the anomaly.** No surrounding
+context is needed to classify it — the `APPREAD` label in column 1 is
+ground truth that this one line indicates an application I/O failure.
+
+> **The single takeaway:** every anomaly in BGL is locatable to one line.
+> No sequence, no block lifecycle, no time-correlation required for the
+> ground-truth labeling. That's why BGL is the natural evaluation dataset
+> for **point detectors** — and why my BGL pipeline skips the sessionizer
+> and wires Z-Score / IQR / CUSUM instead.
+
+---
+
+### Why this matters for PipelineX
+
+> | Dataset says… | PipelineX answers with… |
+> |---|---|
+> | "Anomalies are sequence-shaped" (HDFS) | `BlockSessionizerStage` + `SequenceAnomalyDetector` on the event bus |
+> | "Anomalies are point-shaped numeric outliers" (BGL) | Inline detectors in the stage chain: `ZScoreDetector`, `IQRDetector`, `CUSUMDetector` |
+> | "Schemas are completely different" (regex vs. split, block_id vs. node_id) | Strategy pattern — `HDFSParser` and `BGLParser` behind the same `IParser` interface |
+> | "Anomaly labels live in different files in different formats" | Each dataset's evaluation script joins on its own key (block_id for HDFS, per-line label column for BGL) |
+
+> **The bridge to KLA:** EBeam tool logs almost certainly contain *both*
+> shapes simultaneously — single-line hardware faults (point-shaped) *and*
+> multi-step process sequences that deviate (sequence-shaped). The reason
+> I chose these two datasets specifically is that they let me prove the
+> architecture handles both, on real published labeled data, before applying
+> the same shape to a proprietary log.
+
+**[SAY] (~3 minutes):**
+> Before I show you the implementation, I want to spend three minutes on the
+> two real datasets I evaluated against. Because the *shape* of the
+> anomalies in each one is what drives every architectural choice in the
+> rest of the talk. If I skip this, the next several slides will feel like
+> abstract code rather than answers to concrete problems.
+>
+> Both datasets come from **Loghub**, which is the academic standard for
+> log-analytics benchmarks — it's the canonical corpus that papers in this
+> area evaluate against. I picked these two specifically because they're
+> *orthogonal*. They represent two fundamentally different kinds of anomaly,
+> and if a single architecture handles both, the extensibility claim
+> isn't a slogan — it's demonstrated.
+>
+> **HDFS first.** This is logs from a 200-node Hadoop cluster running a
+> MapReduce benchmark — 11 million lines, about a gigabyte and a half. Look
+> at the raw line at the top. There's a date, a time, a process ID, a
+> level, a Java component name, and a free-form content tail. The crucial
+> field is buried in the content: the **block ID**. HDFS is a distributed
+> file system, and every file is split into blocks. Each block has a
+> *lifecycle* — allocate, receive on three replicas, confirm, serve,
+> eventually delete. That lifecycle spans many log lines, scattered across
+> the cluster and interleaved with every other block's lines.
+>
+> **Crucially, the dataset's ground-truth labels are per-block, not
+> per-line.** Loghub gives me a CSV — 575,061 blocks total, of which
+> 16,838 are labeled anomalous. About three percent. Look at the right
+> column of that anomaly table — every example of what "anomalous" means
+> here is a *pattern*: a write that never completed, replication that
+> failed mid-flight, a delete that happened before the store was
+> confirmed. **In every case, the individual log lines are
+> indistinguishable from normal lines.** The anomaly is in the *sequence*.
+> A regex on a single line cannot find these. That is why the HDFS
+> pipeline has a sessionizer — it has to *reconstruct the sequence* before
+> any detector can score it.
+>
+> Loghub also ships 29 pre-extracted **event templates** — patterns like
+> "Receiving block [*]" or "PacketResponder [*] terminating". Every line in
+> the corpus matches exactly one of those 29 templates. That collapses the
+> 11 million unique strings into sequences of 29-symbol alphabets — which
+> is exactly the input the n-gram detector wants.
+>
+> **BGL is the opposite case.** Logs from Blue Gene/L — an IBM
+> supercomputer at Lawrence Livermore National Lab, 131,000 CPUs and
+> 32,000 gigabytes of RAM. 4.75 million lines, about 700 megabytes. Look at
+> the schema — the first column of every single line is the
+> **ground-truth label itself**. A dash means normal. Anything else is an
+> alert code that tells you what kind of fault this one line represents.
+> `KERNDTLB` is a kernel data-TLB error. `APPREAD` is the application
+> control stream failing. There are about 30 distinct alert codes covering
+> roughly 348,000 lines — about seven percent of the corpus.
+>
+> Look at the example anomaly at the bottom of the BGL section. One line.
+> Self-contained. The label `APPREAD` in column 1 is the ground truth that
+> this line — by itself, in isolation — represents an application failure.
+> No surrounding context required. That's the textbook **point anomaly**
+> model — and that's why the BGL pipeline skips the sessionizer entirely
+> and instead wires three numeric detectors against per-line or per-window
+> features.
+>
+> **The bottom of the slide is the bridge.** Two datasets, two opposite
+> anomaly shapes, one architecture. HDFS forces sessionization plus
+> sequence detection. BGL forces per-line parsing plus point detection.
+> The Strategy pattern handles the wildly different schemas. The factories
+> and the YAML configs decide which path runs. Every architectural choice
+> you're about to see is a *response* to something on this slide.
+>
+> And the reason I think this matters for KLA specifically: EBeam tool
+> logs almost certainly contain *both* of these shapes simultaneously —
+> single-line hardware faults that are point-shaped, and multi-step
+> process recipes that deviate, which are sequence-shaped. The reason I
+> picked these two datasets is precisely to prove the architecture handles
+> both before ever applying the same approach to a proprietary log.
+
+**[NOTES]**
+- This slide is *context*, not deep technical content. Don't rush, but
+  don't linger past three minutes — every subsequent slide will be richer
+  for the audience knowing this.
+- The orthogonality framing (point vs. sequence) is the most important
+  takeaway. You will refer back to it on Slides 6, 7, 10, 12, and 13.
+- If asked "why not just use one dataset?" — single-dataset projects
+  prove the *detector*. Two-orthogonal-dataset projects prove the
+  *architecture*. The architecture is the thing being interviewed for.
+- If asked "is BGL realistic for modern systems?" — yes. Same architectural
+  shape appears in nginx access logs, syslog, and any tool log with
+  per-line severity codes. BGL is the labeled stand-in.
+- If asked about Loghub or the citations — Loghub is Zhu et al. ISSRE
+  2023. BGL's original paper is Oliner & Stearley DSN 2007. HDFS labels
+  trace back to Xu et al. SOSP 2009. All three are in the data READMEs.
+- If asked "what about HDFS_v2 or HDFS_v3?" — same schema family, larger
+  corpus, no per-block labels published. v1 is the only one with
+  reproducible ground truth, which is why every published baseline uses it.
+
+---
+
+# Slide 6 — Config → Pipeline (YAML to Built Pipeline)
 
 > *Two YAML files on the left, the resulting pipeline layout on the right,
 > and the builder code snippet at the bottom. No prose on the slide — let
@@ -409,7 +645,7 @@ def build_pipeline(config: PipelineConfig) -> BuiltPipeline:
 
 ---
 
-# Slide 6 — Example Trace: HDFS and BGL through the Pipeline
+# Slide 7 — Example Trace: HDFS and BGL through the Pipeline
 
 > *This is a two-part slide. Show HDFS first, then BGL. If your slide tool
 > allows builds/animations, reveal each stage one at a time as you speak.*
@@ -660,7 +896,7 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 7 — Concurrency Engine
+# Slide 8 — Concurrency Engine
 
 **Visual:**
 
@@ -737,7 +973,7 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 8 — Error Classification & Graceful Shutdown
+# Slide 9 — Error Classification & Graceful Shutdown
 
 **Visual:**
 
@@ -795,7 +1031,7 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 9 — Sessionizer & Sequence Detector — Deep Dive
+# Slide 10 — Sessionizer & Sequence Detector — Deep Dive
 
 > *This is the deepest technical slide of the talk. Plan for ~5 minutes.
 > Two halves: how the sessionizer builds a trace, then how the sequence
@@ -971,7 +1207,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 10 — Design Patterns: Problem → Pattern
+# Slide 11 — Design Patterns: Problem → Pattern
 
 **Visual:**
 
@@ -1040,7 +1276,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 11 — Results: HDFS Sequence Detection
+# Slide 12 — Results: HDFS Sequence Detection
 
 **Visual:**
 
@@ -1094,7 +1330,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 12 — Results: BGL Point Detection + Throughput
+# Slide 13 — Results: BGL Point Detection + Throughput
 
 **Visual:**
 
@@ -1154,7 +1390,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 13 — Summary
+# Slide 14 — Summary
 
 **Visual:**
 
@@ -1192,7 +1428,7 @@ set (137 distinct 2-grams from training):
 
 ---
 
-# Slide 14 — Thank You & Q&A
+# Slide 15 — Thank You & Q&A
 
 **Visual:**
 
