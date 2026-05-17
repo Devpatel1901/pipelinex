@@ -447,15 +447,28 @@ KERNDTLB 1117838611 2005.06.03 R23-M1-N6-I:J18-U01 2005-06-03-15.43.31.041218 R2
 │     enabled: false                  │ ──────▶ │   (no sessionizer — BGL is point anomalies)    │
 │                                     │         │                                                │
 │   detectors:                        │         │              │                                 │
-│     - kind: z_score                 │         │              ▼                                 │
-│       threshold: 3.0                │ ──────▶ │   DetectorStage([                              │
-│       window_size: 200              │         │     ZScoreDetector(threshold=3.0, win=200),    │
-│     - kind: iqr                     │ ──────▶ │     IQRDetector(k=1.5, win=200),               │
-│       k: 1.5                        │         │     CUSUMDetector(threshold=5.0, slack=0.5)    │
-│     - kind: cusum                   │ ──────▶ │   ])                                           │
-│       threshold: 5.0                │         │                                                │
-│       slack: 0.5                    │         │              │                                 │
-│                                     │         │              ▼                                 │
+│     # per-line                      │         │              ▼                                 │
+│     - kind: label                   │ ──────▶ │   DetectorStage([                              │
+│       label_key: bgl_label          │         │     LabelAnomalyDetector(                      │
+│       normal_value: "-"             │         │       label_key="bgl_label",                   │
+│                                     │         │       normal_value="-"),                       │
+│     # per-window                    │         │                                                │
+│     - kind: window_features         │ ──────▶ │     WindowFeatureDetector(                     │
+│       window_seconds: 60            │         │       window_seconds=60,                       │
+│       weight_alert: 0.5             │         │       weights={alert:.5, entropy:.15,          │
+│       weight_entropy: 0.15          │         │                node:.15, novelty:.20},         │
+│       weight_node: 0.15             │         │       score_threshold=0.5),                    │
+│       weight_novelty: 0.20          │         │                                                │
+│       score_threshold: 0.5          │         │                                                │
+│     # rate-only baselines           │         │                                                │
+│     - kind: z_score                 │ ──────▶ │     ZScoreDetector(threshold=3.0, win=200),    │
+│       threshold: 3.0                │         │     IQRDetector(k=1.5, win=200),               │
+│     - kind: iqr                     │ ──────▶ │     CUSUMDetector(threshold=5.0, slack=0.5)    │
+│       k: 1.5                        │         │   ])                                           │
+│     - kind: cusum                   │         │                                                │
+│       threshold: 5.0                │         │              │                                 │
+│       slack: 0.5                    │         │              ▼                                 │
+│                                     │         │                                                │
 │   repository: { kind: memory }      │ ──────▶ │   InMemoryLogRepository (batch=100)            │
 │                                     │         │                                                │
 │   runtime:                          │         │   PipelineExecutor                             │
@@ -523,8 +536,12 @@ def build_pipeline(config: PipelineConfig) -> BuiltPipeline:
 > turns on the sessionizer with a 30-second idle window, and wires a
 > sequence detector to the event bus — because HDFS anomalies are
 > sequence-shaped. The BGL pipeline turns off the template matcher, turns
-> off the sessionizer, and instead instantiates three inline point detectors
-> — Z-Score, IQR, and CUSUM — because BGL anomalies are per-line and numeric.
+> off the sessionizer, and instantiates a stack of inline detectors:
+> `LabelAnomalyDetector` honours the per-line ground-truth label that
+> BGL emits in column 1; `WindowFeatureDetector` scores each one-minute
+> window on four engineered features (alert density, severity entropy,
+> node diversity, template novelty); and Z-Score, IQR, and CUSUM keep
+> the original rate-only baselines for comparison.
 >
 > The builder code at the bottom is what makes this work. About fifty lines.
 > It reads the validated Pydantic config, calls a factory for each component,
@@ -677,31 +694,35 @@ INPUT (raw string from FileLogSource):
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 3 · ENRICH (RateAggregator — 1-minute windows)                         │
+│ STAGE 3 · ENRICH                                                             │
 │                                                                              │
-│   Bin by minute:   record falls into window "2005-06-03 15:43"               │
-│   Increment counter for that window: count = 184                             │
-│   (Note: no sessionizer for BGL — point anomalies, no block_id)              │
-│                                                                              │
-│   OUTPUT — same LogRecord; window-count side-channel for detector            │
+│   No template matcher, no sessionizer — BGL is per-line / per-window only.   │
+│   Record passes through unchanged.                                           │
 └──────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 4 · DETECT — IQRDetector                                               │
+│ STAGE 4 · DETECT — DetectorStage fans out the record to every detector       │
 │                                                                              │
-│   Running window stats (warmup over prior 100 minutes):                      │
-│     Q1 = 5    median = 12    Q3 = 28    IQR = 23                             │
-│     Upper Tukey fence = Q3 + 1.5·IQR = 28 + 34.5 = 62.5                      │
-│   Current window count = 184                                                 │
-│   184 > 62.5  →  outlier                                                     │
+│   ┌─ LabelAnomalyDetector ──────────────────────────────────────────────┐    │
+│   │   Reads enrichment["bgl_label"] = "KERNDTLB"  (≠ "-")               │    │
+│   │   FIRES IMMEDIATELY — single-line ground-truth alert                │    │
+│   │   AnomalyEvent(detector_name="label", severity=1.0,                 │    │
+│   │                metadata={"bgl_label": "KERNDTLB"})                  │    │
+│   └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
-│   OUTPUT — AnomalyEvent:                                                     │
-│     detector_name="iqr",                                                     │
-│     severity_score=(184-62.5)/23 = 5.3,                                      │
-│     log_record_id=UUID('c4d1…'),                                             │
-│     metadata={"window_start": "2005-06-03 15:43", "count": 184,              │
-│               "fence_upper": 62.5}                                           │
+│   ┌─ WindowFeatureDetector ─────────────────────────────────────────────┐    │
+│   │   Buffers record into 60-s window "2005-06-03 15:43:00"             │    │
+│   │   Window stays open until a record from the *next* bucket arrives;  │    │
+│   │   on roll-over the closed window scores 4 features:                 │    │
+│   │     alert_density · severity_entropy · node_diversity · novelty     │    │
+│   │   Weighted sum > 0.5 → fires on the FIRST record of the next bucket │    │
+│   └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│   ┌─ Z-Score / IQR / CUSUM  (rate-only baselines — kept for comparison)  ┐   │
+│   │   Run on per-minute counts; their unchanged F1 ~0.20 is part of      │   │
+│   │   the v1→v2 "wrong feature, not wrong detector" story (Slide 13).    │   │
+│   └──────────────────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -713,8 +734,8 @@ INPUT (raw string from FileLogSource):
 ---
 
 > **Same pipeline code. Two completely different anomaly models.**
-> *HDFS exercises sessionization + sequence detection.*
-> *BGL exercises rate aggregation + point detection.*
+> *HDFS exercises sessionization + KL-divergence sequence detection.*
+> *BGL exercises per-line label detection + per-window feature scoring.*
 
 **[SAY] (~4 minutes):**
 > Let me make all of that concrete by tracing one real line from each
@@ -765,26 +786,33 @@ INPUT (raw string from FileLogSource):
 > **Parse.** The BGL parser uses `str.split`, not a regex, because the tail
 > of a BGL line is free-form. The first field is the per-line label —
 > `KERNDTLB` here, meaning a kernel data TLB error. That single field tells
-> us this is an anomalous line.
+> us this is an anomalous line, and it's stored in the record's enrichment.
 >
 > **Validate.** Same chain, all pass.
 >
-> **Enrich.** Instead of template matching, we have a rate aggregator —
-> it bins records by one-minute window. This record falls into the
-> 15:43–15:44 window, whose count is now 184.
+> **Enrich.** Nothing happens here for BGL. No template matcher, no
+> sessionizer — BGL anomalies are per-line and per-window, not
+> sequence-shaped. The record passes through unchanged.
 >
-> **Detect.** The IQR detector — which I'll explain on a later slide — has
-> been tracking the rolling distribution of per-minute counts. The
-> interquartile range is from 5 to 28, so the upper Tukey fence sits at
-> 62.5. The current window has 184 events, which is well above the fence.
-> The detector fires an anomaly event with a severity score reflecting how
-> far past the fence we are.
+> **Detect.** This is where the v2 BGL ensemble fans out. The
+> `DetectorStage` hands the record to every detector in parallel.
+> `LabelAnomalyDetector` reads the `bgl_label` field, sees `KERNDTLB`
+> instead of a dash, and **fires immediately** — that's the trust-the-source
+> path, and it's why per-line BGL F1 is 1.0. At the same time,
+> `WindowFeatureDetector` buffers this record into its 60-second bucket;
+> when the next record arrives in a later bucket, the closed window gets
+> scored on four engineered features — alert density, severity entropy,
+> node diversity, template novelty — and fires if the weighted sum
+> crosses threshold. The original z-score, IQR, and CUSUM detectors run
+> alongside, scoring per-minute event counts; their unchanged ~0.20 F1
+> is part of the story I'll show on the results slide.
 >
 > **The punch line is at the bottom of the slide.** Same pipeline code, same
 > stage chain, same async machinery. Two completely different anomaly
-> models — one operates on sequences of events, the other on numeric
-> windows. That's the architectural claim, demonstrated on real lines of
-> real data.
+> models — HDFS exercises sessionization plus KL-divergence sequence
+> detection; BGL exercises per-line label honouring plus per-window
+> feature scoring. That's the architectural claim, demonstrated on real
+> lines of real data.
 
 **[NOTES]**
 - This is the longest slide of the talk. Don't rush. Let the audience read
@@ -978,84 +1006,63 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-### Part B — `KLDivergenceSequenceDetector` (KL on bigram frequencies, n=2)
+### Part B — `KLDivergenceSequenceDetector` — what it does, in one slide
 
 > ### The intuition in one sentence
-> Build the trace's **bigram frequency distribution Q**, compare against the
-> **reference distribution P** learned from normal blocks, and fire when
-> the divergence is large. Same `ISequenceAnomalyDetector` interface as v1
-> — just better math.
+> Build a **fingerprint** of how normal blocks usually flow. For each new
+> block, build *its* fingerprint. Fire when the two fingerprints look
+> meaningfully different.
 
-**The formula (one line of code):**
-
-```
-KL(Q || P) = Σ   Q(g) · log( Q(g) / P(g) )
-            g∈trace
-                                                    count(g) + α
-where g  = a bigram in the trace,     P(g) = ─────────────────────────────
-      Q(g) = trace frequency of g           total_bigrams + α · V²
-      α   = 0.5  (Lidstone smoothing, keeps log finite on unseen bigrams)
-      V   = vocabulary size = 29 (templates E1..E29)
-```
-
-> ### Training (offline) — `scripts/train_sequence_model.py`
-> 1. Parse the 11.17M-line HDFS log, sessionize, join `anomaly_label.csv`
-> 2. Keep only **labeled-Normal** traces (558,223 of them)
-> 3. **Counter** of every bigram → `{(E22,E5): 18,432, (E5,E11): 9,810, …}`
-> 4. Save as `KLSequenceModel` JSON → `models/hdfs_kl_v1.json`
->    (vocab V=29, **137 distinct bigrams seen, ~10.3 M total bigrams**)
-
-**Worked example — one anomalous trace:**
+**Picture it — normal reference (P) vs. an anomalous trace (Q):**
 
 ```
-Trace event sequence:  E22 → E5 → E5 → E5 → E11
-Bigrams (Q):           (E22,E5)×1, (E5,E5)×2, (E5,E11)×1     ← total 4
+Reference P  (learned offline from 558K normal blocks)
+   (E5,E11)   ████████████████████████  most common pair in normal traffic
+   (E22,E5)   ████████████████
+   (E11,E9)   ███████████
+   (E9,E21)   █████████
+   (E5,E5)    .                          essentially never seen normally
+   ...
 
-         g            Q(g)     count(g) in P    P(g) ≈            Q·log(Q/P)
-   ─────────────  ─────────  ───────────────  ─────────────  ───────────────
-   (E22,E5)         1/4=0.25      18,432       1.785e-3        0.25·log(140)  =  +1.235
-   (E5,E5)          2/4=0.50           0       4.84e-8         0.50·log(1.03e7) = +8.069   ◀ huge: bigram never seen normal
-   (E5,E11)         1/4=0.25       9,810       9.50e-4         0.25·log(263)   = +1.392
-                                                              ───────────────
-                                                   KL(Q||P) ≈  +10.696 nats
-                                              max_contrib  ≈   +8.069 nats   ◀ default score_mode
-
-   Threshold = 0.3 nats   →   8.07 > 0.3   →   FIRE
+Trace Q  (one new block being scored)
+   (E5,E11)   █████                      under-represented vs. normal
+   (E22,E5)   █████
+   (E5,E5)    ██████████                 over-represented — and rare in P!
+                                         ↑ this is the surprise that fires the detector
 ```
 
-**Scoring code (the loop, verbatim from `sequence_kl.py:184`):**
+**What fires, what stays silent:**
+
+> | The trace's fingerprint looks like… | Detector | Why |
+> |---|---|---|
+> | Every bigram appears at roughly normal proportions | **silent** | the two fingerprints overlap |
+> | Bigrams seen in training, but in unusual proportions | **fires softly** | distribution drift — caught by full KL |
+> | At least one bigram that's essentially never seen normally | **fires hard** | one surprise dominates — caught by `max_contrib` |
+
+**The math is one line — that's it:**
+
+```
+KL(Q || P)  =  Σ   Q(g) · log( Q(g) / P(g) )         higher = more different
+              g∈Q
+```
+
+*(A small smoothing constant on P keeps `log` finite when the trace contains a bigram the reference has never seen.)*
+
+**The scoring loop — five lines of real Python:**
 
 ```python
 async def detect_trace(self, trace: BlockTrace) -> AnomalyEvent | None:
-    observed = list(ngrams(trace.event_sequence, n=2))
-    if len(observed) < self._min_trace_len:
-        return None
-
-    q_counts: dict[tuple[str,...], int] = {}
-    for g in observed:
-        q_counts[g] = q_counts.get(g, 0) + 1
-    total_q = len(observed)
-
-    contribs, kl = [], 0.0
-    for g, c in q_counts.items():
-        q_prob = c / total_q
-        p_prob = self._model.smoothed_prob(g)       # Lidstone-smoothed
-        contrib = q_prob * math.log(q_prob / p_prob)
-        contribs.append((g, contrib))
-        kl += contrib
-
-    max_contrib = max(c for _, c in contribs)
-    score = kl if self._score_mode == "kl" else max_contrib
-    if score <= self._threshold:
-        return None
-    return AnomalyEvent(detector_name="sequence_kl", severity_score=score, ...)
+    for g, q_prob in trace_bigram_distribution(trace):
+        p_prob = reference.smoothed_prob(g)
+        score += q_prob * math.log(q_prob / p_prob)
+    return AnomalyEvent(...) if score > threshold else None
 ```
 
-> ### Two scoring modes — both come for free from the same contributions
-> | mode | what it asks | strength |
-> |---|---|---|
-> | `kl` | "Is the **whole** distribution different from normal?" | catches diffuse, multi-bigram drift |
-> | `max_contrib` *(default)* | "Is there **one** surprising bigram?" | robust on short noisy traces — won't trip on diffuse small deviations |
+> ### Two scoring modes (configurable from YAML)
+> | mode | the question it asks |
+> |---|---|
+> | **`kl`** | "Is the **whole** distribution different from normal?" |
+> | **`max_contrib`** *(default)* | "Is there **one** surprising bigram?" — more robust on short traces |
 >
 
 **[SAY] (~5 minutes):**
@@ -1101,61 +1108,73 @@ async def detect_trace(self, trace: BlockTrace) -> AnomalyEvent | None:
 > is a *derived* artifact, not a transformation.
 >
 > **Part B — the v2 sequence detector.** The detector subscribes to those
-> closed-trace events. For each one, it asks a single question:
-> **is this trace's bigram frequency distribution different enough from
-> the normal reference distribution to count as an anomaly?** That's KL
-> divergence — Kullback-Leibler. One line of math at the top of the slide.
+> closed-trace events. Here's the whole idea in one breath: **build a
+> fingerprint of how normal blocks usually flow, build the same kind of
+> fingerprint for each new block, and fire when the two fingerprints
+> look meaningfully different.**
 >
-> The training step is offline and runs in about three minutes. I parse
-> the full 11-million-line HDFS log, sessionize it, join against the
-> published per-block labels, keep only the labeled-Normal traces, and
-> instead of just collecting a *set* of bigrams the way the v1 detector
-> did, I build a **Counter** — every bigram and how many times it
-> appeared. The result is a tiny reference model: vocab of 29 templates,
-> 137 distinct bigrams ever seen in normal traffic, about 10 million
-> total bigram occurrences. That's the P distribution.
+> The picture at the top of the slide shows what that means. The top
+> bar chart is the **reference fingerprint** — call it P. I built it
+> offline by parsing the full 11-million-line HDFS log, sessionizing it,
+> keeping only the *labeled-normal* blocks, and counting how often each
+> pair of consecutive events shows up. Some pairs are extremely common,
+> some are essentially never seen. That's the reference for "what
+> normal looks like."
 >
-> At scoring time, look at the worked example in the middle of the slide.
-> Take a real anomalous trace — E22, E5, E5, E5, E11. Its bigrams are
-> (E22,E5), (E5,E5), (E5,E5), (E5,E11). I build the Q distribution from
-> those four bigrams, then sum each `Q(g) · log(Q(g)/P(g))`. The middle
-> bigram, (E5,E5), is the killer: it never appeared in any normal trace,
-> so P is essentially the Lidstone-smoothing floor — about 5×10⁻⁸. The
-> log of Q over that floor is enormous, and that single bigram contributes
-> ~8 nats to the score. KL is well above threshold and the detector fires.
+> The bottom bar chart is **the trace being scored** — call it Q. The
+> detector builds the same kind of fingerprint from just this one
+> block's events. Then it compares the two distributions. If they
+> overlap closely, the block is healthy. If a pair shows up in the
+> trace that *almost never* appears in normal traffic — like the
+> highlighted bar — that's the surprise that fires the detector.
 >
-> **Lidstone smoothing** — that's the alpha=0.5 in the denominator — is
-> the piece that makes this safe in production. Without it, an unseen
-> bigram makes P zero, and `log(Q/0)` is infinite. Smoothing keeps every
-> probability strictly positive and the math finite. That's what lets the
-> detector handle bigrams it has never seen before without crashing.
+> The "what fires, what stays silent" table is the intuition you should
+> take away. Trace looks like normal traffic → silent. Trace uses
+> familiar pairs but in *odd proportions* → fires softly. Trace contains
+> a pair that's basically never seen normally → fires hard.
 >
-> Two scoring modes come out of the same math for free. **Full KL** asks
-> "is the whole distribution different." **max_contrib** — which is the
-> default — asks "is there one surprisingly bad bigram." On short noisy
-> traces, full KL can be jittery; max_contrib is more robust. Both ship,
-> both are configurable from YAML.
+> The math that formalises this is **KL divergence** — Kullback-Leibler.
+> One line, at the bottom of the slide. The intuition is exactly what
+> the picture shows: sum up, across every pair in the trace, how
+> *surprising* it is relative to normal. Bigger sum, bigger surprise.
+> If that sum crosses my threshold, I fire.
 >
-> Why KL and not PCA or an LSTM or Drain. Three reasons. About 200 lines
-> of code, zero ML dependencies, fully deterministic — no GPU, no model
-> training run that takes hours. Fully **explainable**: when the detector
-> fires, the event metadata includes `top_contributors` — the actual
-> bigrams that drove the score. I can show a reviewer "this is why."
-> Embedding-space methods can't do that. And third, KL **captures the
-> distributional anomalies** that set-membership misses — reordered
-> events, missing terminals, frequency drift. The results slide will
-> show that this lifted recall from 0.29 to 0.73.
+> The actual scoring loop is five lines of Python. I won't read them out
+> — the point is that it's *small*. About two hundred lines total for
+> the whole detector, zero ML dependencies, deterministic, runs in
+> microseconds per trace.
+>
+> Why I chose this over an LSTM or PCA or Drain. Three reasons. It's
+> **small** — easy to read, easy to maintain. It's **explainable** —
+> when it fires, the event metadata lists *exactly which pairs* drove
+> the score, so I can show a reviewer "this is why." Embedding-space
+> methods can't do that. And it **catches the distributional anomalies
+> that the v1 set-membership detector missed** — reordered events,
+> missing terminals, frequency drift. The results slide will show that
+> this single change lifted recall from 0.29 to 0.73.
 
 **[NOTES]**
 - This is the slide that deserves the most rehearsal. Three strong claims
   must land cleanly: (1) UUIDs not records, (2) timeout-not-terminal,
-  (3) KL on frequencies, with the worked example showing why an unseen
-  bigram dominates the score.
+  (3) KL is "comparing fingerprints" — keep the metaphor; do not
+  derive math on the projector.
 - The phrase "bounded memory is a contract, not a hope" is yours — use it.
-- If asked "why not just learn an embedding?" — explainability. KL gives
-  you the bigram that fired; an LSTM gives you a vector.
-- If asked "what does alpha control?" — smoothing strength. α=0.5 is
-  Jeffreys' prior; sweep showed it was insensitive between 0.1 and 1.0.
+- **Numeric walk-through (Q&A backup only — do not put on the slide).**
+  Trace `E22 → E5 → E5 → E5 → E11` → bigrams (E22,E5)×1, (E5,E5)×2,
+  (E5,E11)×1, total 4. (E5,E5) is essentially unseen in normal training,
+  so its smoothed P is ~5×10⁻⁸. Its contribution alone is
+  `0.5 · log(0.5 / 5e⁻⁸) ≈ 8 nats`, blowing past the 0.3-nat threshold.
+  Score the same trace in `kl` mode and you get ~10.7 nats — same
+  conclusion.
+- If asked "what does smoothing actually do?" — keeps `log(Q/P)` finite
+  when the trace contains a bigram the reference never saw. Without it,
+  P=0 and `log` blows up. Lidstone with α=0.5 is Jeffreys' prior; a
+  sweep showed the detector was insensitive between 0.1 and 1.0.
+- If asked "why not just learn an embedding?" — explainability. KL tells
+  you *which bigram fired*. An LSTM gives you a vector.
+- If asked "two scoring modes — when does each one matter?" — `kl`
+  catches diffuse drift across many bigrams; `max_contrib` is more
+  robust on short noisy traces. Both ship; default is `max_contrib`.
 
 ---
 
