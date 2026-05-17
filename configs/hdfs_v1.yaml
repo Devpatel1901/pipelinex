@@ -31,9 +31,12 @@ sessionizer:
 detectors: []
 
 sequence_detector:
-  kind: sequence_ngram
-  model_path: models/hdfs_ngram_v1.json
-  threshold: 0.0
+  kind: sequence_kl
+  model_path: models/hdfs_kl_v1.json
+  threshold: 0.3
+  alpha: 0.5
+  min_trace_len: 2
+  score_mode: max_contrib
 
 repository:
   kind: memory

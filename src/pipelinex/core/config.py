@@ -26,8 +26,8 @@ Example::
       - { kind: z_score, threshold: 3.0, window_size: 200 }
 
     sequence_detector:
-      kind: sequence_ngram
-      model_path: models/hdfs_ngram_v1.json
+      kind: sequence_kl
+      model_path: models/hdfs_kl_v1.json
 
     repository:
       kind: memory
@@ -82,9 +82,12 @@ class DetectorConfig(BaseModel):
 
 class SequenceDetectorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: str = "sequence_ngram"
+    kind: str = "sequence_kl"
     model_path: str | None = None
-    threshold: float = 0.0
+    threshold: float = 0.3
+    alpha: float = 0.5
+    min_trace_len: int = 2
+    score_mode: str = "max_contrib"
 
 
 class SessionizerConfig(BaseModel):
@@ -102,10 +105,32 @@ class TemplateMatcherConfig(BaseModel):
     templates_path: str = "data/HDFS/preprocessed/HDFS.log_templates.csv"
 
 
+class PostgresPoolConfig(BaseModel):
+    """Per-pool overrides. ``None`` means use the num_workers-derived default."""
+
+    model_config = ConfigDict(extra="forbid")
+    pool_size: int | None = Field(default=None, ge=1)
+    max_overflow: int | None = Field(default=None, ge=0)
+    pool_timeout_s: float | None = Field(default=None, gt=0.0)
+    pool_pre_ping: bool | None = None
+
+
+class CircuitBreakerConfig(BaseModel):
+    """Repository circuit-breaker tuning."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    failure_threshold: int = Field(default=5, ge=1)
+    window_seconds: float = Field(default=30.0, gt=0.0)
+    cooldown_s: float = Field(default=10.0, ge=0.0)
+
+
 class RepositoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["memory", "postgres"] = "memory"
     dsn: str | None = None
+    pool: PostgresPoolConfig | None = None
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
 
     @model_validator(mode="after")
     def _dsn_required_for_postgres(self) -> RepositoryConfig:

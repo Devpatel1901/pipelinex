@@ -58,10 +58,13 @@ async def _run_and_assert(
         flush_interval_s=0.05,
     )
     result = await executor.run()
-    accounted = result.records_processed + result.records_failed
+    accounted = (
+        result.records_processed + result.records_failed + result.records_shed
+    )
     assert accounted == len(lines), (
         f"records_in={len(lines)} processed={result.records_processed} "
-        f"failed={result.records_failed} (lost={len(lines) - accounted})"
+        f"failed={result.records_failed} shed={result.records_shed} "
+        f"(lost={len(lines) - accounted})"
     )
 
 

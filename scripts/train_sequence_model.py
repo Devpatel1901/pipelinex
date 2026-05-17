@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Train the n-gram sequence model from labeled HDFS data.
+"""Train the KL-divergence sequence model from labeled HDFS data.
 
 Pipeline
 --------
 1. Stream-parse ``data/HDFS/HDFS.log`` line-by-line via ``HDFSParser``.
-2. Match each parsed line to one of the 30 templates in
+2. Match each parsed line to one of the 29 templates in
    ``HDFS.log_templates.csv`` to assign an event_id.
 3. Group events by ``block_id`` (extracted from the message).
 4. Join blocks with ``data/HDFS/preprocessed/anomaly_label.csv``.
-5. Build the set of bigrams seen *only* in Normal blocks.
-6. Persist the model as ``models/hdfs_ngram_v1.json``.
+5. Count bigram occurrences across labelled-Normal blocks.
+6. Persist the model as ``models/hdfs_kl_v1.json`` (Counter, not set).
 
 Memory: streams the file; keeps one ``dict[block_id, list[str]]`` plus
 the labels CSV (a flat ~18 MB dict). On a laptop with 8 GB RAM this fits
@@ -28,13 +28,13 @@ import csv
 import json
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # Make src/ importable when running directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pipelinex.detectors.sequence import SequenceModel, ngrams
+from pipelinex.detectors.sequence_kl import KLSequenceModel, ngrams
 from pipelinex.stages.enrichment.template_matcher import TemplateMatcherStage
 from pipelinex.stages.parsing.hdfs_parser import HDFSParser
 
@@ -44,16 +44,22 @@ DEFAULT_LABELS = REPO_ROOT / "data" / "HDFS" / "preprocessed" / "anomaly_label.c
 DEFAULT_TEMPLATES = (
     REPO_ROOT / "data" / "HDFS" / "preprocessed" / "HDFS.log_templates.csv"
 )
-DEFAULT_MODEL_OUT = REPO_ROOT / "models" / "hdfs_ngram_v1.json"
+DEFAULT_MODEL_OUT = REPO_ROOT / "models" / "hdfs_kl_v1.json"
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train HDFS n-gram sequence model.")
+    p = argparse.ArgumentParser(description="Train HDFS KL-divergence sequence model.")
     p.add_argument("--log", type=Path, default=DEFAULT_LOG)
     p.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
     p.add_argument("--templates", type=Path, default=DEFAULT_TEMPLATES)
     p.add_argument("--out", type=Path, default=DEFAULT_MODEL_OUT)
     p.add_argument("--n", type=int, default=2)
+    p.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+        help="Lidstone smoothing constant for unseen bigrams.",
+    )
     p.add_argument(
         "--max-lines",
         type=int,
@@ -109,7 +115,6 @@ def main() -> int:
             block_id = rec.enrichment.get("block_id")
             if not isinstance(block_id, str):
                 continue
-            # Match a template to assign event_id.
             event_id = _match_event_id(matcher, rec.message)
             if event_id is None:
                 continue
@@ -127,9 +132,9 @@ def main() -> int:
         f"{len(block_events):,} distinct blocks)"
     )
 
-    # --- Step 4: build normal n-grams from labeled-normal blocks only.
-    print(f"[4/5] extracting normal {args.n}-grams")
-    normal_grams: set[tuple[str, ...]] = set()
+    # --- Step 4: count bigrams across labelled-Normal blocks.
+    print(f"[4/5] counting {args.n}-grams from labelled-Normal blocks")
+    bigram_counts: Counter[tuple[str, ...]] = Counter()
     vocabulary: set[str] = set()
     n_normal_used = 0
     n_unlabeled = 0
@@ -140,22 +145,25 @@ def main() -> int:
             continue
         vocabulary.update(events)
         if label == "Normal":
-            normal_grams.update(ngrams(events, args.n))
+            bigram_counts.update(ngrams(events, args.n))
             n_normal_used += 1
     print(
         f"      {n_normal_used:,} normal blocks contributed "
-        f"{len(normal_grams):,} unique {args.n}-grams "
-        f"(vocab size {len(vocabulary)}, "
+        f"{sum(bigram_counts.values()):,} total {args.n}-grams "
+        f"({len(bigram_counts):,} unique, "
+        f"vocab size {len(vocabulary)}, "
         f"{n_unlabeled:,} blocks were unlabeled and ignored)"
     )
 
     # --- Step 5: persist.
     print(f"[5/5] writing model to {args.out}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    model = SequenceModel(
+    model = KLSequenceModel(
         n=args.n,
-        normal_ngrams=frozenset(normal_grams),
+        bigram_counts=dict(bigram_counts),
         vocabulary=frozenset(vocabulary),
+        total_bigrams=sum(bigram_counts.values()),
+        alpha=args.alpha,
     )
     args.out.write_text(json.dumps(model.to_dict(), indent=2))
     print("      done.")

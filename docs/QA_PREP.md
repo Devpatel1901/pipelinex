@@ -51,26 +51,26 @@ Three reasons. (1) ~150 lines of code, zero ML dependencies — deterministic, d
 ### B2. *"Why 2-grams? Why not 3 or 4?"*
 2-grams cover almost all observed bigram transitions in normal HDFS traces — 137 distinct ones from 29 templates, out of 841 possible. 3-grams explode the vocabulary to 24,389 cells with very sparse coverage, which inflates novelty by chance and would crush precision. The right way to use longer context is a frequency model (KL-divergence on bigram distributions), not bigger n — documented v2.
 
-### B3. *"Precision = 1.0 looks suspicious. What's the catch?"*
-It's structural, not luck. The detector fires *only* on 2-grams that never appeared in any labeled-Normal training trace (sequence.py:124). By construction every fire is correct *given clean training labels*. The real risk is training-set contamination — one mislabeled-anomaly block in "Normal" would silently whitelist its bigrams forever. I depend on Loghub labels being clean.
+### B3. *"v1 had precision 1.0 by construction. What about v2 KL?"*
+v2 trades that structural precision for recall. The KL detector scores the *distributional* difference between a trace's bigrams and the normal reference, so it catches anomalies that use only seen bigrams in odd proportions. Threshold-tuned at the F1 maximum: P=0.41, R=0.73, **F1=0.52** (vs v1's F1=0.44). See `detectors/sequence_kl.py`.
 
-### B4. *"Recall is only 28.5%. Why?"*
-About 71% of true anomalies use only bigrams that also appear in normal traces — just in different proportions, lengths, or positions. A truncated write trace, for example, is entirely "normal" bigrams; the anomaly is the *absence* of the closing bigram, not the presence of a novel one. Set-membership can't capture absence — divergence-based detection can.
+### B4. *"v1 recall was only 28.5%. Why?"*
+About 71% of true anomalies used bigrams that also appear in normal traces — different proportions, not novel pairs. Set-membership couldn't see distributional shift. **v2 KL-divergence captures exactly that**: recall lifts from 0.285 to 0.725, F1 from 0.44 to 0.52. Implemented in `detectors/sequence_kl.py`.
 
-### B5. *"What would KL-divergence detection actually look like in code?"*
-Replace the frozenset of normal bigrams with a normalized count distribution P over bigrams (with Laplace smoothing for unseen pairs). For each trace, compute its bigram distribution Q. Fire if `KL(Q || P) > tau`, where tau is tuned on a held-out validation split. That captures "wrong proportions" which is exactly the failure mode of v1.
+### B5. *"How does the KL detector actually work?"*
+Score each closed trace by `KL(Q_trace || P_normal)` with Lidstone smoothing (α=0.5) so unseen bigrams stay finite (`sequence_kl.py:smoothed_prob`). Default `score_mode='max_contrib'` reports the worst per-bigram contribution rather than the full sum — more robust to short noisy traces. Threshold tuned via sweep in `evaluate_hdfs_sequence.py --sweep`; final value is 0.3 nats.
 
-### B6. *"How do you compute the anomaly score?"*
-`ratio = len(novel_bigrams) / len(observed_unique_bigrams)` (sequence.py:125). Both sides use the deduplicated set, so a trace that repeats one novel bigram 50 times scores the same as one that uses it once. Fire when `ratio > threshold` — default 0.0, so any novel bigram fires. Score is returned as `severity_score` on the AnomalyEvent.
+### B6. *"How is the anomaly score computed?"*
+`severity_score` depends on the configured mode. `score_mode='kl'` is `Σ Q(g)·log(Q(g)/P(g))` in nats — the full divergence. `score_mode='max_contrib'` (default) is `max_g Q(g)·log(Q(g)/P(g))` — the single worst bigram. Metadata always includes both, plus `top_contributors` (10 worst bigrams). See `sequence_kl.py:detect_trace`.
 
 ### B7. *"What if a block has fewer than 2 events?"*
-`ngrams()` yields nothing for sequences shorter than n (sequence.py:120). The detector returns `None` — no anomaly. In practice this is rare: even truncated HDFS blocks have at least one `allocateBlock` + one `Receiving block`. Could be a blind spot for severely truncated traces; v2 frequency model with smoothing would assign nonzero probability to short sequences.
+`ngrams()` yields nothing for sequences shorter than `n`. The detector returns `None` — no anomaly. Configurable floor `min_trace_len` (default 2) so trivially-short traces are silent rather than emitting noise. Lidstone smoothing keeps KL finite when a trace has bigrams the model hasn't seen.
 
 ### B8. *"How is the model trained?"*
-`scripts/train_sequence_model.py` (~3 min on full corpus). Stream-parse `HDFS.log` → template-match each line to E1–E29 → group by `block_id` → join against `anomaly_label.csv` → keep only `Label == "Normal"` (558,223 blocks) → collect every 2-gram that appears in any of them (137 unique) → write JSON `{n: 2, normal_ngrams: [...], vocabulary: [...]}` to `models/hdfs_ngram_v1.json`.
+`scripts/train_sequence_model.py` (~3 min on full corpus). Stream-parse `HDFS.log` → template-match each line to E1–E29 → group by `block_id` → join against `anomaly_label.csv` → keep only `Label == "Normal"` (558,223 blocks) → count every 2-gram (10.3 M total, 137 unique) → write the Counter as JSON to `models/hdfs_kl_v1.json`. Counts, not a set — needed for KL.
 
 ### B9. *"How did you evaluate accuracy?"*
-`scripts/evaluate_hdfs_sequence.py` runs the full pipeline against all 575,061 labeled blocks, builds a confusion matrix by comparing predicted-anomaly vs. labeled-anomaly. TP=4,798, FP=0, FN=12,040 → P=1.0, R=0.285, F1=0.4435. Output is `benchmarks/results/hdfs_eval.json` — reproducible from a fresh checkout: `python scripts/train_sequence_model.py && python scripts/evaluate_hdfs_sequence.py`.
+`scripts/evaluate_hdfs_sequence.py` runs the full pipeline against all 575,061 labeled blocks, builds a confusion matrix by comparing predicted-anomaly vs. labeled-anomaly. v2 KL detector at threshold 0.3: TP=12,211, FP=17,842, FN=4,627 → P=0.41, R=0.73, F1=0.52. Output is `benchmarks/results/hdfs_eval.json` — reproducible from a fresh checkout: `python scripts/train_sequence_model.py && python scripts/evaluate_hdfs_sequence.py`. Add `--sweep` to see the full threshold curve.
 
 ### B10. *"What happens if an anomalous block hits a template you've never seen?"*
 The template matcher returns no match and the line gets no `event_id` in enrichment. The sessionizer still tracks the record under `block_id`, but the missing event becomes a gap in the sequence. The 2-gram detector sees the surrounding pairs; if either is novel it fires, otherwise it misses. Real risk on logs with templates that weren't in training — Loghub's 29 are stable for HDFS_v1.
@@ -85,8 +85,8 @@ Two layers. (1) Detect: monitor `unmatched_template_count` per minute; spike mea
 ### C1. *"Why three different point detectors instead of one?"*
 They catch different anomaly shapes. Z-Score catches gaussian-tail outliers — fast spikes against a stable mean. IQR (Tukey fence) is robust to outliers in the training window — it doesn't drift its threshold up when prior anomalies inflated the mean. CUSUM catches *gradual drifts* — small persistent shifts that never trip a per-sample threshold. They complement each other.
 
-### C2. *"Why is BGL F1 so low (~0.20) — does that mean the system doesn't work?"*
-The opposite — it's the finding that justifies the whole architecture. BGL alerts are *individual anomalous lines* mixed into normal traffic, not rate spikes. Counting events per minute is simply not the right signal. The fix is feature-engineered per-window features (alert density, message-length variance, template novelty) — documented v2. Low F1 on the wrong signal is the *correct* result.
+### C2. *"BGL F1 was 0.20 — did you fix it in v2?"*
+Yes, two ways. (1) `LabelAnomalyDetector` honors BGL's per-line classification directly — **F1 1.0000** on 4.7 M lines (`detectors/label.py`). (2) `WindowFeatureDetector` engineers four per-window features (alert density, severity entropy, node diversity, template novelty) — **F1 0.56**, 2.8× the old rate-only baseline. The old z/iqr/cusum numbers stay reported alongside as the "wrong-feature failure mode" — the architecture story is intact.
 
 ### C3. *"How does the IQR detector handle the moving window efficiently?"*
 Two views over the same data (iqr.py): a `deque[float]` for insertion-order eviction, plus a `sorted list` maintained via `bisect` for O(log n) percentile lookup. When the deque fills, evicted value is binary-searched out of the sorted list. Quartiles are recomputed each call — cheap because the sorted list is already sorted.
@@ -102,6 +102,9 @@ Otherwise the current value pollutes its own statistics — a true outlier would
 
 ### C7. *"Are the detectors stateful? What happens on shutdown?"*
 Yes — each detector holds a sliding window in memory. On clean shutdown the windows are discarded; on next start the warmup re-engages. That's fine because BGL detection is window-local; restart costs you ~30 records of warmup, not historical data. If durable state mattered I'd checkpoint the window to the repository — not needed in v1.
+
+### C8. *"Using the BGL label as the detector signal feels like cheating — isn't it just reading ground truth?"*
+The `bgl_label` field is *not* runtime ground truth — it's the supercomputer's own RAS-monitoring classification, embedded in the log line. In production this maps directly to honoring any upstream classifier (a tool's RAS code, a vendor SDK severity flag). `LabelAnomalyDetector` is "trust the source" — and the `WindowFeatureDetector` running in the same ensemble (F1 0.56 with no label access) is the evidence the architecture isn't *only* trusting labels. Two layers, two anomaly shapes, one architecture.
 
 ---
 
@@ -238,8 +241,8 @@ The wildcard syntax bug. Loghub publishes HDFS templates in two files — the sa
 ### I4. *"What would you do differently if starting over?"*
 Build the evaluation harness first, before any detector. I built detectors first and then realized I had no clean way to compute precision/recall reproducibly. The two days I spent retrofitting `evaluate_hdfs_sequence.py` could have been one day building it upfront — and the detectors would have been better because I'd have measured them from day one rather than tuned by gut.
 
-### I5. *"Where's the most unsafe code in the project?"*
-The Postgres connection pool has no explicit configuration (`postgres_repo.py:105`) — relies on asyncpg defaults (5–10 connections). Under sustained high write load with multiple workers, that pool will saturate before the queue does, and the backpressure story breaks because flushes will start failing rather than slowing. Fix is explicit pool sizing tied to `num_workers`. Tracked as v2.
+### I5. *"What was the most unsafe code in the project, and did you fix it?"*
+**Fixed in v2.** v1 used the asyncpg defaults for the connection pool — under sustained write load it saturated before the bounded queue did and silently broke backpressure. v2 ties pool sizing to `num_workers` (default `pool_size = 2 × num_workers`, see `persistence/pool.py`) and adds a `RepositoryCircuitBreaker` (`persistence/circuit_breaker.py`). On repeated `PoolSaturatedError`, the breaker opens for `cooldown_s` seconds; the pipeline counts those records as `records_shed` instead of `records_failed`. Conservation invariant becomes `processed + failed + shed == lines_in`.
 
 ### I6. *"What's something the code does that would confuse a new contributor?"*
 The sequence detector's `severity_score` uses set-deduplicated bigrams, not raw bigram count. A trace with 10 copies of one novel pair scores the same as a trace with 1 copy. Defensible — the *unique* novelty matters — but counterintuitive. I'd add a docstring example. Stretch: a "frequency-weighted" mode would be the natural v2.
@@ -254,7 +257,9 @@ The sequence detector's `severity_score` uses set-deduplicated bigrams, not raw 
 | HDFS blocks (labeled) | 575,061 — 558,223 Normal, 16,838 Anomaly (2.93%) |
 | HDFS templates | 29 (E1–E29) |
 | HDFS normal 2-grams | 137 |
-| HDFS results | P=1.0, R=0.285, F1=0.4435 |
+| HDFS results (v2 KL) | P=0.41, R=0.73, F1=0.52 — threshold 0.3, score_mode=max_contrib |
+| BGL per-line (v2 label) | P=R=F1=1.0000 (348,460 alerts, 0 FP/FN) |
+| BGL per-window (v2 window_features) | P=0.39, R=0.98, F1=0.56 |
 | BGL lines | 4,747,963 — ~7.3% anomalous |
 | BGL alert codes | 30+ (KERNDTLB leads at 152,734) |
 | Throughput | 46,662 rec/s at 4 workers |

@@ -34,7 +34,12 @@ import logging
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from pipelinex.core.exceptions import FatalStageError, RepositoryError, TransientStageError
+from pipelinex.core.exceptions import (
+    FatalStageError,
+    LoadSheddingError,
+    RepositoryError,
+    TransientStageError,
+)
 from pipelinex.core.interfaces import ILogRepository, ILogSource, IPipelineStage
 from pipelinex.core.models import LogRecord, PipelineRunResult
 
@@ -68,6 +73,7 @@ class PipelineExecutor:
 
         self._records_processed = 0
         self._records_failed = 0
+        self._records_shed = 0
         self._anomalies_detected = 0
 
     @property
@@ -106,15 +112,17 @@ class PipelineExecutor:
             run_id=self._run_id,
             records_processed=self._records_processed,
             records_failed=self._records_failed,
+            records_shed=self._records_shed,
             started_at=started,
             completed_at=completed,
             anomalies_detected=self._anomalies_detected,
         )
         logger.info(
-            "pipeline run %s done: processed=%s failed=%s elapsed=%.2fs",
+            "pipeline run %s done: processed=%s failed=%s shed=%s elapsed=%.2fs",
             self._run_id,
             result.records_processed,
             result.records_failed,
+            result.records_shed,
             (completed - started).total_seconds(),
         )
         return result
@@ -144,6 +152,13 @@ class PipelineExecutor:
                     record.mark_stage(stage.name)
                 await self._buffer_for_batch(record)
                 self._records_processed += 1
+            except LoadSheddingError as e:
+                # Circuit breaker is OPEN — count separately so the
+                # conservation invariant remains processed + failed + shed.
+                logger.warning(
+                    "worker %s: load-shed on %s: %s", worker_id, record.id, e
+                )
+                self._records_shed += 1
             except FatalStageError as e:
                 logger.warning("worker %s: fatal error on %s: %s", worker_id, record.id, e)
                 self._records_failed += 1
@@ -174,6 +189,12 @@ class PipelineExecutor:
 
         try:
             await self._repository.save_batch(to_save)
+        except LoadSheddingError as e:
+            # Circuit breaker open during batch flush — these records were
+            # successfully processed but cannot be persisted right now.
+            logger.warning("batch shed (n=%s): %s", len(to_save), e)
+            self._records_shed += len(to_save)
+            self._records_processed -= len(to_save)
         except RepositoryError as e:
             logger.error("batch save failed (n=%s): %s", len(to_save), e)
             self._records_failed += len(to_save)

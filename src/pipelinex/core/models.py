@@ -102,7 +102,15 @@ class BlockTrace:
 
 @dataclass(frozen=True)
 class PipelineRunResult:
-    """Summary returned by ``PipelineExecutor.run()``."""
+    """Summary returned by ``PipelineExecutor.run()``.
+
+    The conservation invariant is::
+
+        records_processed + records_failed + records_shed == lines_in
+
+    where ``records_shed`` is incremented only when the repository circuit
+    breaker is OPEN and refuses a write.
+    """
 
     run_id: UUID
     records_processed: int
@@ -110,3 +118,4 @@ class PipelineRunResult:
     started_at: datetime
     completed_at: datetime
     anomalies_detected: int = 0
+    records_shed: int = 0

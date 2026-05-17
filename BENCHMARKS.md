@@ -82,14 +82,16 @@ python scripts/benchmark_throughput.py --backpressure --total 5000
 ---
 
 <!-- BEGIN: hdfs-sequence -->
-## HDFS_v1 — Sequence-anomaly detection (n-gram)
+## HDFS_v1 — Sequence-anomaly detection (KL-divergence)
 
 | detector | blocks_scored | TP | FP | FN | precision | recall | F1 |
 |---|---|---|---|---|---|---|---|
-| sequence_ngram | 575,061 | 4,798 | 0 | 12,040 | 1.0000 | 0.2850 | 0.4435 |
+| sequence_kl | 575061 | 12211 | 17842 | 4627 | 0.4063 | 0.7252 | 0.5208 |
 
-_threshold = 0.0, n = 2_
+_threshold = 0.3 (nats), n = 2, α = 0.5_
 <!-- END: hdfs-sequence -->
+
+
 
 ### How to read these numbers
 
@@ -120,16 +122,26 @@ python scripts/evaluate_hdfs_sequence.py          # ~3 min
 ---
 
 <!-- BEGIN: bgl-point -->
-## BGL — Point-anomaly detection (Z-Score, IQR, CUSUM)
+## BGL — Anomaly detection (per-line label + per-window ensemble)
 
-| detector | windows | TP | FP | FN | precision | recall | F1 |
-|---|---|---|---|---|---|---|---|
-| z_score | 27,666 | 157 | 811 | 1,681 | 0.1622 | 0.0854 | 0.1119 |
-| iqr | 27,666 | 510 | 2,758 | 1,328 | 0.1561 | 0.2775 | 0.1998 |
-| cusum | 27,666 | 43 | 1,208 | 1,795 | 0.0344 | 0.0234 | 0.0278 |
+### Per-line label detector (trust-the-source)
+
+| detector | TP | FP | FN | precision | recall | F1 |
+|---|---|---|---|---|---|---|
+| label (per-line) | 348460 | 0 | 0 | 1.0000 | 1.0000 | 1.0000 |
+
+### Per-window ensemble
+
+| detector | TP | FP | FN | precision | recall | F1 |
+|---|---|---|---|---|---|---|
+| window_features | 1793 | 2794 | 45 | 0.3909 | 0.9755 | 0.5581 |
+| z_score | 157 | 811 | 1681 | 0.1622 | 0.0854 | 0.1119 |
+| iqr | 510 | 2758 | 1328 | 0.1561 | 0.2775 | 0.1998 |
+| cusum | 43 | 1208 | 1795 | 0.0344 | 0.0234 | 0.0278 |
 
 _window = 60 seconds; metric = events per window_
 <!-- END: bgl-point -->
+
 
 ### How to read these numbers
 

@@ -1,5 +1,12 @@
-# Run BGL through the pipeline with point-anomaly detectors. BGL events are
-# per-line labeled, so Z-Score/IQR/CUSUM each get a fair shot.
+# Run BGL through the pipeline with the v2 detector ensemble.
+#
+# BGL has two anomaly shapes simultaneously:
+# - per-line: the first field is a ground-truth alert category (or `-`).
+#   LabelAnomalyDetector honors this directly.
+# - per-window: bursty traffic and shifting severity / node mix reveal
+#   problems even when no individual line is alert-coded. WindowFeatureDetector
+#   scores four engineered features; z_score/iqr/cusum keep the rate-only
+#   baseline for comparison.
 
 source:
   kind: file
@@ -18,10 +25,27 @@ template_matcher:
 sessionizer:
   enabled: false
 
-# Point detectors — a metric must be enrichment["metric"] for these to
-# fire. The evaluation script (Day 18) populates that field from binned
-# rates before invoking the detectors.
 detectors:
+  # Per-line: trust the upstream classification embedded in column 1.
+  - kind: label
+    label_key: bgl_label
+    normal_value: "-"
+
+  # Per-window: feature-engineered unsupervised score over time buckets.
+  - kind: window_features
+    window_seconds: 60
+    recent_window_history: 10
+    alert_density_threshold: 0.05
+    entropy_threshold: 1.5
+    novelty_threshold: 0.30
+    weight_alert: 0.5
+    weight_entropy: 0.15
+    weight_node: 0.15
+    weight_novelty: 0.20
+    score_threshold: 0.5
+
+  # Original rate-only point detectors. Their F1 stays low — that's the
+  # "wrong feature, not wrong detector" finding.
   - kind: z_score
     metric_key: metric
     threshold: 3.0

@@ -4,8 +4,8 @@ Two event families today:
 
 - ``AnomalyEventPublished``: produced by detectors (Day 6 onward).
 - ``BlockTraceClosed``: produced by ``BlockSessionizerStage`` (Day 13);
-  the ``SequenceAnomalyDetector`` subscribes to these to evaluate closed
-  traces.
+  the ``KLDivergenceSequenceDetector`` subscribes to these to evaluate
+  closed traces.
 
 Adding a new event type does not require any change to the EventBus — that
 is the entire point.

@@ -138,7 +138,7 @@ class TestBuilder:
         cfg = parse_config(
             _minimal_config(
                 tmp_path,
-                sequence_detector={"kind": "sequence_ngram", "threshold": 0.0},
+                sequence_detector={"kind": "sequence_kl", "threshold": 0.0},
             )
         )
         built = build_pipeline(cfg)

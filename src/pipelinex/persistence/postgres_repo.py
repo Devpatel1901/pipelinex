@@ -38,9 +38,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
-from pipelinex.core.exceptions import RepositoryError
+from pipelinex.core.exceptions import PoolSaturatedError, RepositoryError
 from pipelinex.core.interfaces import (
     AggregateResult,
     Aggregation,
@@ -48,6 +49,7 @@ from pipelinex.core.interfaces import (
     QueryFilters,
 )
 from pipelinex.core.models import AnomalyEvent, BlockTrace, LogRecord, Severity
+from pipelinex.persistence.pool import PoolConfig, build_pool_kwargs
 
 _metadata = MetaData()
 
@@ -101,8 +103,22 @@ class PostgresLogRepository(ILogRepository):
         self._sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
     @classmethod
-    def from_dsn(cls, dsn: str) -> PostgresLogRepository:
-        engine = create_async_engine(dsn, future=True)
+    def from_dsn(
+        cls,
+        dsn: str,
+        *,
+        num_workers: int = 4,
+        pool: PoolConfig | None = None,
+    ) -> PostgresLogRepository:
+        """Build a repo with explicit pool sizing tied to ``num_workers``.
+
+        Saturation behavior: ``pool.pool_timeout_s`` (default 5 s) caps the
+        wait for a free connection. Beyond that, SQLAlchemy raises
+        ``TimeoutError`` which this class translates to
+        ``PoolSaturatedError`` so the circuit breaker can react.
+        """
+        kwargs = build_pool_kwargs(num_workers, pool)
+        engine = create_async_engine(dsn, future=True, **kwargs)
         return cls(engine)
 
     async def close(self) -> None:
@@ -120,6 +136,8 @@ class PostgresLogRepository(ILogRepository):
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(log_records_table.insert(), rows)
+        except SATimeoutError as e:
+            raise PoolSaturatedError(f"save_batch: pool checkout timed out: {e}") from e
         except SQLAlchemyError as e:
             raise RepositoryError(f"save_batch failed: {e}") from e
 
@@ -133,6 +151,10 @@ class PostgresLogRepository(ILogRepository):
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(block_traces_table.insert(), rows)
+        except SATimeoutError as e:
+            raise PoolSaturatedError(
+                f"save_trace_batch: pool checkout timed out: {e}"
+            ) from e
         except SQLAlchemyError as e:
             raise RepositoryError(f"save_trace_batch failed: {e}") from e
 
@@ -152,6 +174,10 @@ class PostgresLogRepository(ILogRepository):
                         }
                     ],
                 )
+        except SATimeoutError as e:
+            raise PoolSaturatedError(
+                f"save_anomaly: pool checkout timed out: {e}"
+            ) from e
         except SQLAlchemyError as e:
             raise RepositoryError(f"save_anomaly failed: {e}") from e
 

@@ -30,7 +30,6 @@ from pipelinex.core.pipeline import PipelineExecutor
 from pipelinex.core.sources import FileLogSource, IterableLogSource, StdinLogSource
 from pipelinex.detectors.detector_stage import DetectorStage
 from pipelinex.detectors.factory import default_factory as default_detector_factory
-from pipelinex.detectors.sequence import SequenceAnomalyDetector, SequenceModel
 from pipelinex.events.bus import EventBus
 from pipelinex.events.events import BlockTraceClosed
 from pipelinex.persistence.memory_repo import InMemoryLogRepository
@@ -119,10 +118,34 @@ def _build_repository(config: PipelineConfig) -> ILogRepository:
     if rc.kind == "memory":
         return InMemoryLogRepository()
     if rc.kind == "postgres":
+        from pipelinex.persistence.circuit_breaker import RepositoryCircuitBreaker
+        from pipelinex.persistence.pool import PoolConfig
         from pipelinex.persistence.postgres_repo import PostgresLogRepository
 
         assert rc.dsn is not None  # guarded by Pydantic validator
-        return PostgresLogRepository.from_dsn(rc.dsn)
+        pool_overrides = (
+            PoolConfig(
+                pool_size=rc.pool.pool_size,
+                max_overflow=rc.pool.max_overflow,
+                pool_timeout_s=rc.pool.pool_timeout_s,
+                pool_pre_ping=rc.pool.pool_pre_ping,
+            )
+            if rc.pool is not None
+            else None
+        )
+        repo: ILogRepository = PostgresLogRepository.from_dsn(
+            rc.dsn,
+            num_workers=config.runtime.num_workers,
+            pool=pool_overrides,
+        )
+        if rc.circuit_breaker.enabled:
+            repo = RepositoryCircuitBreaker(
+                inner=repo,
+                failure_threshold=rc.circuit_breaker.failure_threshold,
+                window_seconds=rc.circuit_breaker.window_seconds,
+                cooldown_s=rc.circuit_breaker.cooldown_s,
+            )
+        return repo
     raise ConfigurationError(f"unsupported repository.kind: {rc.kind}")
 
 
@@ -198,11 +221,12 @@ def _build_sequence_detector(
         return None
     sd_cfg = config.sequence_detector
     factory = default_detector_factory()
-    detector = factory.create_sequence(sd_cfg.kind, threshold=sd_cfg.threshold)
+    kwargs = sd_cfg.model_dump(exclude={"kind", "model_path"})
+    detector = factory.create_sequence(sd_cfg.kind, **kwargs)
 
-    if isinstance(detector, SequenceAnomalyDetector) and sd_cfg.model_path:
+    if sd_cfg.model_path and hasattr(detector, "load_model"):
         try:
-            detector.set_model(SequenceModel.load(sd_cfg.model_path))
+            detector.load_model(sd_cfg.model_path)
         except (FileNotFoundError, OSError) as e:
             logger.warning(
                 "sequence model not available at %s (%s); detector starts empty",
