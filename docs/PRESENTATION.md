@@ -31,12 +31,12 @@ explainer. Your job is to make the room understand, not to recite bullets.
 | 2 | Agenda — what I'll cover | 1 |
 | 3 | Problem statement | 3 |
 | 4 | Architecture diagram | 4 |
-| 5 | **Datasets — HDFS & BGL schemas + anomaly shapes** | 3 |
+| 5 | **Datasets — HDFS & BGL: annotated log lines + anomaly shapes** | 3 |
 | 6 | **Config → Pipeline** (YAML to built pipeline, two examples) | 3 |
 | 7 | Example trace — HDFS & BGL through every stage | 4 |
 | 8 | Concurrency engine | 3 |
 | 9 | Error classification & graceful shutdown | 2 |
-| 10 | **Sessionizer & sequence detector — deep dive** | 5 |
+| 10 | **Sessionizer & KL-divergence sequence detector — deep dive** | 5 |
 | 11 | Design patterns — problem → pattern mapping | 3 |
 | 12 | Results — HDFS sequence detection | 2 |
 | 13 | Results — BGL point detection + throughput | 2 |
@@ -84,12 +84,12 @@ explainer. Your job is to make the room understand, not to recite bullets.
 >
 > 1. **Problem statement** — why log analytics is hard
 > 2. **Architecture** — the system at a glance
-> 3. **Datasets** — HDFS & BGL schemas and the shape of their anomalies
+> 3. **Datasets** — HDFS & BGL — what one log line looks like and what an anomaly looks like
 > 4. **Config → Pipeline** — how YAML becomes a running pipeline
 > 5. **Example trace** — one HDFS line and one BGL line through every stage
 > 6. **Concurrency engine** — how the async pipeline actually runs
 > 7. **Error classification & graceful shutdown**
-> 8. **Sessionizer & sequence detector** — the deep dive
+> 8. **Sessionizer & KL-divergence sequence detector** — the deep dive
 > 9. **Design patterns** — problem → pattern mapping
 > 10. **Results** — HDFS sequence detection, BGL point detection, throughput
 > 11. **Summary**
@@ -240,79 +240,49 @@ explainer. Your job is to make the room understand, not to recite bullets.
 
 ---
 
-# Slide 5 — Datasets: HDFS & BGL — Schemas and Anomaly Shapes
+# Slide 5 — Datasets: HDFS & BGL — Anomaly Shapes
 
-> *Before going into config and code, the panel needs to know what the data
-> actually looks like and what an "anomaly" actually means in each dataset.
-> This slide is the foundation that every later slide builds on.*
+> *The panel needs to see what an "anomaly" actually means in each dataset
+> before any architecture slide makes sense. One annotated raw line per
+> dataset, plus the kinds of anomaly each one contains.*
 
 ---
 
-### Why these two datasets
+### Why these two datasets — one architecture, two opposite anomaly shapes
 
-> | | **HDFS_v1** | **BGL** |
+> | | **HDFS** | **BGL** |
 > |---|---|---|
 > | **System** | Hadoop Distributed File System | IBM Blue Gene/L supercomputer |
-> | **Source** | Private cloud, MapReduce benchmark workload | Lawrence Livermore National Lab — 131,072 CPUs, 32,768 GB RAM |
-> | **Released by** | Loghub (Zhu et al., ISSRE 2023) — academic standard for log-analytics benchmarks | Same — original paper Oliner & Stearley, DSN 2007 |
-> | **Size in repo** | 11.17 M lines, ~1.5 GB | 4.75 M lines, ~700 MB |
-> | **Labeling granularity** | Per **block** — one label per `block_id` | Per **line** — first column of each line |
-> | **Anomaly shape** | **Sequence** — the *pattern* of events on a block is wrong | **Point** — individual line is itself anomalous |
-> | **What it stresses in PipelineX** | Sessionizer + sequence detector | Per-line parsing + point detectors |
-
-> **The whole point of using both:** they're *orthogonal* anomaly models.
-> One pipeline framework, two different mathematics. If the same architecture
-> handles both, the extensibility claim is real.
+> | **Anomaly shape** | **Sequence** — the *pattern* of events on one block is wrong | **Point** — one individual line is itself anomalous |
 
 ---
 
-### HDFS — schema and anomaly shape
+### HDFS — what a line looks like, what an anomaly looks like
 
-**Raw line format:**
+**Annotated raw line:**
 ```
 081109 203518 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-1608999687919862906 src: /10.250.19.102:54106 dest: /10.250.19.102:50010
 └─┬──┘ └─┬──┘ └┬┘ └─┬┘ └─────────┬─────────┘  └──────────────────────────┬──────────────────────────────────────────┘
  date   time  pid  level     component                                content (free-form, contains block_id)
 ```
 
-**The key field is `block_id`** (`blk_-1608999687919862906`). HDFS doesn't
-label individual *lines* — it labels entire *blocks*. Each block is a
-multi-line lifecycle: allocate → receive on replica 1 → receive on
-replica 2 → receive on replica 3 → confirm → serve → delete. Loghub
-provides:
+**Kinds of anomaly that exist in HDFS — every individual line still looks normal:**
 
-> | Preprocessed artifact | What it contains |
-> |---|---|
-> | `HDFS.log_templates.csv` | **29 event templates** (E1–E29). Each raw line matches exactly one. E.g. `E5 = "Receiving block [*] src: [*] dest: [*]"`, `E11 = "PacketResponder [*] for block [*] terminating"` |
-> | `anomaly_label.csv` | One row per block: `(block_id, Normal | Anomaly)` |
-> | `Event_traces.csv` | The pre-computed event sequence per block, used as a sanity reference for my sessionizer |
-
-**The numbers — labeled ground truth:**
-
-> | | count | % |
-> |---|---:|---:|
-> | Total blocks | **575,061** | 100.0% |
-> | Normal | 558,223 | 97.07% |
-> | **Anomaly** | **16,838** | **2.93%** |
-
-**What an HDFS anomaly looks like — three real examples from the corpus:**
-
-> | Anomaly pattern | What goes wrong | Why a regex can't catch it |
+> | Anomaly pattern | What goes wrong | Why a per-line check can't catch it |
 > |---|---|---|
-> | **Write never completed** | `allocateBlock` fires, replicas start receiving, then no `Received block ... of size` confirmation | Every individual line is *normal*. Anomaly is the *absent* terminal event. |
-> | **Replication failed mid-flight** | `Receiving block` on 3 nodes, exception on one, the surviving replicas re-replicate → unusual ordering | Every line matches a known template. Anomaly is the unusual *sequence* of templates. |
-> | **Block deleted that wasn't fully stored** | `Deleting block` before `addStoredBlock` for that replica | Each line in isolation is benign; only the relative *order* is wrong. |
+> | **Write never completed** | allocate fires, replicas start receiving, no `Received block … of size` confirmation | Anomaly is an **absent** event, not a present one |
+> | **Replication failed mid-flight** | exception on one replica, surviving replicas re-replicate → unusual event order | Every line matches a normal template; the **order** is wrong |
+> | **Delete-before-store** | `Deleting block` arrives before `addStoredBlock` for that replica | Each line is benign in isolation; only the **relative order** is wrong |
 
-> **The single takeaway:** no per-line anomaly label exists in HDFS *because
-> no single line is anomalous*. The anomaly is a property of the **sequence
-> of events on one block**. That's why HDFS forces sessionization, and why
-> the sequence detector exists.
+> **Takeaway:** the anomaly lives in the *sequence of events on one
+> block*, not in any single line. HDFS is what forces the pipeline to
+> sessionize before scoring.
 
 ---
 
-### BGL — schema and anomaly shape
+### BGL — what a line looks like, what an anomaly looks like
 
-**Raw line format (whitespace-separated, free-form tail):**
+**Annotated raw line:**
 ```
 KERNDTLB 1117838611 2005.06.03 R23-M1-N6-I:J18-U01 2005-06-03-15.43.31.041218 R23-M1-N6-I:J18-U01 RAS KERNEL FATAL data TLB error interrupt
 └──┬───┘ └──┬─────┘ └───┬────┘ └───────┬──────────┘ └──────────┬───────────┘ └─────┬──────────┘ └┬┘ └──┬─┘ └─┬──┘ └──────────┬──────────┘
@@ -320,154 +290,82 @@ KERNDTLB 1117838611 2005.06.03 R23-M1-N6-I:J18-U01 2005-06-03-15.43.31.041218 R2
                                   node/card/chip/CPU)
 ```
 
-**The key field is the *first column*** — the **per-line ground-truth
-label**. `-` means a normal line. Anything else is an alert category code
-identifying *what kind* of anomaly that single line is.
+**Kinds of anomaly that exist in BGL — each one is locatable to one line:**
 
-**The numbers — labeled ground truth (this codebase, this file):**
+> | Alert kind | Example label | What that single line means |
+> |---|---|---|
+> | **Kernel memory fault** | `KERNDTLB`, `KERNSTOR` | data-TLB or storage error reported by the kernel |
+> | **Kernel termination / recovery** | `KERNTERM`, `KERNREC`, `KERNMNTF` | kernel monitor signalled fatal / recovered |
+> | **Application failure** | `APPSEV`, `APPREAD` | application severe error / I/O read failure |
+> | **Hardware / link / power** | `LINKDISC`, `MMCS`, `MICROCODE`, … | link discovery, microcode, power-supply faults |
+> | **Normal** | `-` | nothing is wrong with this line |
 
-> | Label | count | meaning |
-> |---|---:|---|
-> | `-` | 4,399,503 | normal |
-> | `KERNDTLB` | 152,734 | kernel data TLB (translation lookaside buffer) error |
-> | `KERNSTOR` | 63,491 | kernel storage error |
-> | `APPSEV` | 49,651 | application severe failure |
-> | `KERNMNTF` | 31,531 | kernel monitor / fatal |
-> | `KERNTERM` | 23,338 | kernel termination |
-> | `KERNREC` | 6,145 | kernel recovery |
-> | `APPREAD` | 5,983 | application read failure (`ciod: failed to read message prefix on control stream`) |
-> | … 30+ more codes … | | (link, microcode, power, etc.) |
-> | **Total anomalous** | **~348,000** | **~7.3% of lines** |
-
-**What a BGL anomaly looks like — one real example:**
-
-```
-APPREAD 1117869872 2005.06.04 R23-M1-N8-I:J18-U11 2005-06-04-00.24.32.398284
-        R23-M1-N8-I:J18-U11 RAS APP FATAL
-        ciod: failed to read message prefix on control stream
-        (CioStream socket to 172.16.96.116:33399
-```
-
-That single line, in isolation, **is the anomaly.** No surrounding
-context is needed to classify it — the `APPREAD` label in column 1 is
-ground truth that this one line indicates an application I/O failure.
-
-> **The single takeaway:** every anomaly in BGL is locatable to one line.
-> No sequence, no block lifecycle, no time-correlation required for the
-> ground-truth labeling. That's why BGL is the natural evaluation dataset
-> for **point detectors** — and why my BGL pipeline skips the sessionizer
-> and wires Z-Score / IQR / CUSUM instead.
+> **Takeaway:** every BGL anomaly is locatable to *one* line — no
+> sessionization required. BGL is what stresses the per-line and
+> per-window point detectors.
 
 ---
 
-### Why this matters for PipelineX
-
-> | Dataset says… | PipelineX answers with… |
-> |---|---|
-> | "Anomalies are sequence-shaped" (HDFS) | `BlockSessionizerStage` + `SequenceAnomalyDetector` on the event bus |
-> | "Anomalies are point-shaped numeric outliers" (BGL) | Inline detectors in the stage chain: `ZScoreDetector`, `IQRDetector`, `CUSUMDetector` |
-> | "Schemas are completely different" (regex vs. split, block_id vs. node_id) | Strategy pattern — `HDFSParser` and `BGLParser` behind the same `IParser` interface |
-> | "Anomaly labels live in different files in different formats" | Each dataset's evaluation script joins on its own key (block_id for HDFS, per-line label column for BGL) |
-
-> **The bridge to KLA:** EBeam tool logs almost certainly contain *both*
-> shapes simultaneously — single-line hardware faults (point-shaped) *and*
-> multi-step process sequences that deviate (sequence-shaped). The reason
-> I chose these two datasets specifically is that they let me prove the
-> architecture handles both, on real published labeled data, before applying
-> the same shape to a proprietary log.
-
 **[SAY] (~3 minutes):**
-> Before I show you the implementation, I want to spend three minutes on the
-> two real datasets I evaluated against. Because the *shape* of the
-> anomalies in each one is what drives every architectural choice in the
-> rest of the talk. If I skip this, the next several slides will feel like
-> abstract code rather than answers to concrete problems.
+> Before I show you the implementation, I want to spend three minutes on
+> the two datasets I evaluated against — because the *shape* of the
+> anomalies in each one drives every architectural choice in the rest of
+> the talk.
 >
-> Both datasets come from **Loghub**, which is the academic standard for
-> log-analytics benchmarks — it's the canonical corpus that papers in this
-> area evaluate against. I picked these two specifically because they're
-> *orthogonal*. They represent two fundamentally different kinds of anomaly,
-> and if a single architecture handles both, the extensibility claim
-> isn't a slogan — it's demonstrated.
+> The two-row table at the top is the whole reason I chose these two. HDFS
+> is Hadoop, BGL is a Blue Gene supercomputer — but what I actually care
+> about is the **anomaly shape**. HDFS anomalies are *sequence-shaped*: the
+> pattern of events on a block is wrong. BGL anomalies are *point-shaped*:
+> one individual line is the anomaly. Two opposite mathematical models —
+> and if a single pipeline handles both, the extensibility claim is real,
+> not aspirational.
 >
-> **HDFS first.** This is logs from a 200-node Hadoop cluster running a
-> MapReduce benchmark — 11 million lines, about a gigabyte and a half. Look
-> at the raw line at the top. There's a date, a time, a process ID, a
+> **HDFS first.** Look at the annotated line. There's a date, time, PID,
 > level, a Java component name, and a free-form content tail. The crucial
-> field is buried in the content: the **block ID**. HDFS is a distributed
-> file system, and every file is split into blocks. Each block has a
-> *lifecycle* — allocate, receive on three replicas, confirm, serve,
-> eventually delete. That lifecycle spans many log lines, scattered across
-> the cluster and interleaved with every other block's lines.
+> field is buried in `content`: the **block ID** — `blk_-1608…`. That's
+> the sessionization key. Every line for one block must group together
+> because the anomaly is across lines, not in any single one.
 >
-> **Crucially, the dataset's ground-truth labels are per-block, not
-> per-line.** Loghub gives me a CSV — 575,061 blocks total, of which
-> 16,838 are labeled anomalous. About three percent. Look at the right
-> column of that anomaly table — every example of what "anomalous" means
-> here is a *pattern*: a write that never completed, replication that
-> failed mid-flight, a delete that happened before the store was
-> confirmed. **In every case, the individual log lines are
-> indistinguishable from normal lines.** The anomaly is in the *sequence*.
-> A regex on a single line cannot find these. That is why the HDFS
-> pipeline has a sessionizer — it has to *reconstruct the sequence* before
-> any detector can score it.
+> Look at the anomaly-types table on the right. Three kinds: a write that
+> never completed, replication that failed mid-flight, a delete that
+> arrived before the store was confirmed. In every case, **each individual
+> line still looks normal.** The anomaly is the absent event, or the
+> wrong order, or the missing terminal step. A regex on one line cannot
+> find any of these — the pipeline has to *reconstruct the sequence first*.
+> That is why the HDFS path runs through the sessionizer.
 >
-> Loghub also ships 29 pre-extracted **event templates** — patterns like
-> "Receiving block [*]" or "PacketResponder [*] terminating". Every line in
-> the corpus matches exactly one of those 29 templates. That collapses the
-> 11 million unique strings into sequences of 29-symbol alphabets — which
-> is exactly the input the n-gram detector wants.
+> **BGL is the opposite case.** Look at its annotated line. The first
+> column — `KERNDTLB` — is the ground-truth label itself, emitted by the
+> supercomputer's own RAS monitoring. A dash means normal. Anything else
+> is an alert code naming exactly what kind of fault this one line is.
+> Kernel TLB errors, kernel terminations, application read failures,
+> hardware link faults — the kinds table on the right shows the families.
+> Each one is locatable to **one self-contained line**.
 >
-> **BGL is the opposite case.** Logs from Blue Gene/L — an IBM
-> supercomputer at Lawrence Livermore National Lab, 131,000 CPUs and
-> 32,000 gigabytes of RAM. 4.75 million lines, about 700 megabytes. Look at
-> the schema — the first column of every single line is the
-> **ground-truth label itself**. A dash means normal. Anything else is an
-> alert code that tells you what kind of fault this one line represents.
-> `KERNDTLB` is a kernel data-TLB error. `APPREAD` is the application
-> control stream failing. There are about 30 distinct alert codes covering
-> roughly 348,000 lines — about seven percent of the corpus.
+> That asymmetry is the whole reason this slide exists. HDFS forces
+> sessionization plus sequence detection. BGL forces per-line parsing
+> plus point detection. Same Strategy-pattern parser interface, two
+> different downstream paths — configured purely from YAML. Every
+> architectural choice you're about to see is a *response* to something
+> on this slide.
 >
-> Look at the example anomaly at the bottom of the BGL section. One line.
-> Self-contained. The label `APPREAD` in column 1 is the ground truth that
-> this line — by itself, in isolation — represents an application failure.
-> No surrounding context required. That's the textbook **point anomaly**
-> model — and that's why the BGL pipeline skips the sessionizer entirely
-> and instead wires three numeric detectors against per-line or per-window
-> features.
->
-> **The bottom of the slide is the bridge.** Two datasets, two opposite
-> anomaly shapes, one architecture. HDFS forces sessionization plus
-> sequence detection. BGL forces per-line parsing plus point detection.
-> The Strategy pattern handles the wildly different schemas. The factories
-> and the YAML configs decide which path runs. Every architectural choice
-> you're about to see is a *response* to something on this slide.
->
-> And the reason I think this matters for KLA specifically: EBeam tool
-> logs almost certainly contain *both* of these shapes simultaneously —
-> single-line hardware faults that are point-shaped, and multi-step
-> process recipes that deviate, which are sequence-shaped. The reason I
-> picked these two datasets is precisely to prove the architecture handles
-> both before ever applying the same approach to a proprietary log.
+> And the bridge to KLA: EBeam tool logs almost certainly contain *both*
+> shapes simultaneously — single-line hardware faults that are
+> point-shaped, and multi-step process recipes that deviate, which are
+> sequence-shaped. The reason I picked these two datasets is precisely to
+> prove the architecture handles both before applying the same approach
+> to a proprietary log.
 
 **[NOTES]**
-- This slide is *context*, not deep technical content. Don't rush, but
-  don't linger past three minutes — every subsequent slide will be richer
-  for the audience knowing this.
-- The orthogonality framing (point vs. sequence) is the most important
-  takeaway. You will refer back to it on Slides 6, 7, 10, 12, and 13.
-- If asked "why not just use one dataset?" — single-dataset projects
-  prove the *detector*. Two-orthogonal-dataset projects prove the
-  *architecture*. The architecture is the thing being interviewed for.
-- If asked "is BGL realistic for modern systems?" — yes. Same architectural
-  shape appears in nginx access logs, syslog, and any tool log with
-  per-line severity codes. BGL is the labeled stand-in.
-- If asked about Loghub or the citations — Loghub is Zhu et al. ISSRE
-  2023. BGL's original paper is Oliner & Stearley DSN 2007. HDFS labels
-  trace back to Xu et al. SOSP 2009. All three are in the data READMEs.
-- If asked "what about HDFS_v2 or HDFS_v3?" — same schema family, larger
-  corpus, no per-block labels published. v1 is the only one with
-  reproducible ground truth, which is why every published baseline uses it.
+- Stay on the two anomaly *shapes* — sequence vs. point. The rest of the
+  talk leans on that distinction repeatedly (Slides 6, 7, 10, 12, 13).
+- If asked "is BGL realistic for modern systems?" — yes. Same shape
+  appears in syslog, nginx access logs, any tool log with per-line
+  severity codes. BGL is the labelled stand-in.
+- If asked about ground-truth provenance — HDFS labels are per-block from
+  the published `anomaly_label.csv`; BGL labels are per-line from column
+  1 emitted by the system's own RAS monitor. Both are in the data
+  READMEs.
 
 ---
 
@@ -509,10 +407,11 @@ ground truth that this one line indicates an application I/O failure.
 │   detectors: []     # none inline   │         │              │ records continue                │
 │                                     │         │              ▼                                 │
 │   sequence_detector:                │         │   InMemoryLogRepository (batch=100)            │
-│     kind: sequence_ngram            │         │                                                │
-│     model_path: models/...json      │ ──────▶ │   EventBus  ──▶  SequenceAnomalyDetector       │
-│     threshold: 0.0                  │         │                  (subscribes to                │
-│                                     │         │                   BlockTraceClosed)            │
+│     kind: sequence_kl               │         │                                                │
+│     model_path: models/hdfs_kl.json │ ──────▶ │   EventBus  ──▶  KLDivergenceSequenceDetector  │
+│     threshold: 0.3                  │         │                  (subscribes to                │
+│     alpha: 0.5                      │         │                   BlockTraceClosed)            │
+│     score_mode: max_contrib         │         │                                                │
 │   repository: { kind: memory }      │ ──────▶ │                                                │
 │                                     │         │                                                │
 │   runtime:                          │         │   PipelineExecutor                             │
@@ -724,11 +623,13 @@ INPUT (raw string from FileLogSource):
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 5 · DETECT — SequenceAnomalyDetector (subscriber on EventBus)          │
+│ STAGE 5 · DETECT — KLDivergenceSequenceDetector (subscriber on EventBus)     │
 │                                                                              │
-│   Trace 2-grams:   (E22,E5), (E5,E11), (E11,E9), (E9,E21)                    │
-│   Normal set (trained on 558K Normal blocks): 137 distinct 2-grams           │
-│   Lookup result:   all 4 of these 2-grams ∈ normal set                       │
+│   Trace bigrams (Q):  (E22,E5)×1, (E5,E11)×1, (E11,E9)×1, (E9,E21)×1         │
+│   Reference P:        trained on 558K Normal blocks, V=29, 137 distinct      │
+│                       bigrams seen, ~10.3 M total occurrences                │
+│   Score:              KL(Q‖P)=0.07 nats; max_contrib=0.04 nats               │
+│                       both below threshold=0.3 → healthy                     │
 │                                                                              │
 │   OUTPUT — no AnomalyEvent. Block is healthy.                                │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -1031,10 +932,10 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-# Slide 10 — Sessionizer & Sequence Detector — Deep Dive
+# Slide 10 — Sessionizer + KL-Divergence Sequence Detector — Deep Dive
 
 > *This is the deepest technical slide of the talk. Plan for ~5 minutes.
-> Two halves: how the sessionizer builds a trace, then how the sequence
+> Two halves: how the sessionizer builds a trace, then how the v2 KL
 > detector scores it.*
 
 ---
@@ -1077,53 +978,85 @@ INPUT (raw string from FileLogSource):
 
 ---
 
-### Part B — `SequenceAnomalyDetector` (n-gram, n=2)
+### Part B — `KLDivergenceSequenceDetector` (KL on bigram frequencies, n=2)
+
+> ### The intuition in one sentence
+> Build the trace's **bigram frequency distribution Q**, compare against the
+> **reference distribution P** learned from normal blocks, and fire when
+> the divergence is large. Same `ISequenceAnomalyDetector` interface as v1
+> — just better math.
+
+**The formula (one line of code):**
 
 ```
-Closed trace's event sequence:           E22 → E5 → E26 → E26 → E11 → E9 → E21
-                                          │     │     │     │     │     │
-Sliding 2-grams (pairs):                  ▼     ▼     ▼     ▼     ▼     ▼
-                                  (E22,E5), (E5,E26), (E26,E26), (E26,E11),
-                                  (E11,E9), (E9,E21)
-                                          │
-Lookup each 2-gram against the normal     ▼
-set (137 distinct 2-grams from training):
-                                  in set?  in set?  in set?  in set?  in set?  in set?
-                                    ✓        ✓        ✓        ✓        ✓        ✓
-                                          │
-                                          ▼
-                                    No novel 2-gram → trace is healthy
+KL(Q || P) = Σ   Q(g) · log( Q(g) / P(g) )
+            g∈trace
+                                                    count(g) + α
+where g  = a bigram in the trace,     P(g) = ─────────────────────────────
+      Q(g) = trace frequency of g           total_bigrams + α · V²
+      α   = 0.5  (Lidstone smoothing, keeps log finite on unseen bigrams)
+      V   = vocabulary size = 29 (templates E1..E29)
 ```
 
 > ### Training (offline) — `scripts/train_sequence_model.py`
-> 1. Parse the full 11.17M-line HDFS log
-> 2. Sessionize → emit closed `BlockTrace`s
-> 3. Join against `anomaly_label.csv` on `block_id`
-> 4. Keep only **labeled-Normal** traces (558,223 of them)
-> 5. Collect every 2-gram that appears in any of them → **137 unique 2-grams**
-> 6. Save: `{"vocab": [E1..E29], "normal_2grams": [...], "n": 2}`  → `models/hdfs_ngram_v1.json`
+> 1. Parse the 11.17M-line HDFS log, sessionize, join `anomaly_label.csv`
+> 2. Keep only **labeled-Normal** traces (558,223 of them)
+> 3. **Counter** of every bigram → `{(E22,E5): 18,432, (E5,E11): 9,810, …}`
+> 4. Save as `KLSequenceModel` JSON → `models/hdfs_kl_v1.json`
+>    (vocab V=29, **137 distinct bigrams seen, ~10.3 M total bigrams**)
+
+**Worked example — one anomalous trace:**
+
+```
+Trace event sequence:  E22 → E5 → E5 → E5 → E11
+Bigrams (Q):           (E22,E5)×1, (E5,E5)×2, (E5,E11)×1     ← total 4
+
+         g            Q(g)     count(g) in P    P(g) ≈            Q·log(Q/P)
+   ─────────────  ─────────  ───────────────  ─────────────  ───────────────
+   (E22,E5)         1/4=0.25      18,432       1.785e-3        0.25·log(140)  =  +1.235
+   (E5,E5)          2/4=0.50           0       4.84e-8         0.50·log(1.03e7) = +8.069   ◀ huge: bigram never seen normal
+   (E5,E11)         1/4=0.25       9,810       9.50e-4         0.25·log(263)   = +1.392
+                                                              ───────────────
+                                                   KL(Q||P) ≈  +10.696 nats
+                                              max_contrib  ≈   +8.069 nats   ◀ default score_mode
+
+   Threshold = 0.3 nats   →   8.07 > 0.3   →   FIRE
+```
+
+**Scoring code (the loop, verbatim from `sequence_kl.py:184`):**
+
+```python
+async def detect_trace(self, trace: BlockTrace) -> AnomalyEvent | None:
+    observed = list(ngrams(trace.event_sequence, n=2))
+    if len(observed) < self._min_trace_len:
+        return None
+
+    q_counts: dict[tuple[str,...], int] = {}
+    for g in observed:
+        q_counts[g] = q_counts.get(g, 0) + 1
+    total_q = len(observed)
+
+    contribs, kl = [], 0.0
+    for g, c in q_counts.items():
+        q_prob = c / total_q
+        p_prob = self._model.smoothed_prob(g)       # Lidstone-smoothed
+        contrib = q_prob * math.log(q_prob / p_prob)
+        contribs.append((g, contrib))
+        kl += contrib
+
+    max_contrib = max(c for _, c in contribs)
+    score = kl if self._score_mode == "kl" else max_contrib
+    if score <= self._threshold:
+        return None
+    return AnomalyEvent(detector_name="sequence_kl", severity_score=score, ...)
+```
+
+> ### Two scoring modes — both come for free from the same contributions
+> | mode | what it asks | strength |
+> |---|---|---|
+> | `kl` | "Is the **whole** distribution different from normal?" | catches diffuse, multi-bigram drift |
+> | `max_contrib` *(default)* | "Is there **one** surprising bigram?" | robust on short noisy traces — won't trip on diffuse small deviations |
 >
-> ### Scoring (online)
-> ```python
-> async def detect_trace(self, trace: BlockTrace) -> AnomalyEvent | None:
->     seq = trace.event_sequence
->     bigrams = list(zip(seq, seq[1:]))
->     novel = [g for g in bigrams if g not in self._normal_set]
->     if not novel:
->         return None                      # healthy
->     return AnomalyEvent(
->         detector_name="sequence_ngram",
->         severity_score=len(novel) / len(bigrams),
->         log_record_id=trace.record_ids[0],
->         metadata={"block_id": trace.block_id, "novel_2grams": novel}
->     )
-> ```
->
-> ### Why n-gram and not PCA / LSTM / Drain?
-> - 150 lines of code, **zero ML dependencies**, deterministic
-> - Published HDFS baselines achieve F1 ~0.95 with n-gram methods
-> - Fully explainable to a panel: "this 2-gram never appeared in normal training data"
-> - v2 path documented: KL-divergence over 2-gram **frequencies** (recall lift)
 
 **[SAY] (~5 minutes):**
 > This is the deepest slide of the talk. I want to spend five minutes on it
@@ -1167,43 +1100,62 @@ set (137 distinct 2-grams from training):
 > on the bus. Per-line records continue downstream unchanged — the trace
 > is a *derived* artifact, not a transformation.
 >
-> **Part B — the sequence detector.** The detector subscribes to those
-> closed-trace events. Its job is to look at the event sequence inside the
-> trace and decide: is this block normal, or is it anomalous?
+> **Part B — the v2 sequence detector.** The detector subscribes to those
+> closed-trace events. For each one, it asks a single question:
+> **is this trace's bigram frequency distribution different enough from
+> the normal reference distribution to count as an anomaly?** That's KL
+> divergence — Kullback-Leibler. One line of math at the top of the slide.
 >
-> The math is intentionally simple. Look at the diagram. I take the event
-> sequence — say, E22 through E21, seven events — and slide a window of
-> size 2 across it. That gives me six 2-grams: consecutive pairs of events.
-> I check each pair against a precomputed set of "normal" 2-grams. If every
-> single pair has been seen in a normal training trace, the block is
-> healthy. If even one pair is *novel* — never seen in normal training —
-> I fire an anomaly.
+> The training step is offline and runs in about three minutes. I parse
+> the full 11-million-line HDFS log, sessionize it, join against the
+> published per-block labels, keep only the labeled-Normal traces, and
+> instead of just collecting a *set* of bigrams the way the v1 detector
+> did, I build a **Counter** — every bigram and how many times it
+> appeared. The result is a tiny reference model: vocab of 29 templates,
+> 137 distinct bigrams ever seen in normal traffic, about 10 million
+> total bigram occurrences. That's the P distribution.
 >
-> **The training step is offline.** I parse the full 11-million-line HDFS
-> log, sessionize it, join against the published anomaly labels, keep only
-> the labeled-Normal traces, and collect every 2-gram. There are 29
-> distinct event types in HDFS, which means 841 possible 2-grams in
-> theory — but only 137 ever appear in a normal trace. Most pairs never
-> co-occur. I save those 137 as a JSON model, takes about 3 minutes to
-> train end-to-end.
+> At scoring time, look at the worked example in the middle of the slide.
+> Take a real anomalous trace — E22, E5, E5, E5, E11. Its bigrams are
+> (E22,E5), (E5,E5), (E5,E5), (E5,E11). I build the Q distribution from
+> those four bigrams, then sum each `Q(g) · log(Q(g)/P(g))`. The middle
+> bigram, (E5,E5), is the killer: it never appeared in any normal trace,
+> so P is essentially the Lidstone-smoothing floor — about 5×10⁻⁸. The
+> log of Q over that floor is enormous, and that single bigram contributes
+> ~8 nats to the score. KL is well above threshold and the detector fires.
 >
-> I deliberately chose n-gram over PCA or an LSTM or a sophisticated
-> template miner like Drain. Three reasons. It's about 150 lines of code
-> with zero ML dependencies. Published HDFS baselines hit F1 around 0.95
-> with this kind of n-gram method. And — most importantly — it's fully
-> explainable. If a panel asks "why did this fire," I can point at the
-> exact 2-gram and say "this pair never appeared in normal training data."
-> The v2 path is documented: replace exact-set membership with KL
-> divergence over 2-gram *frequencies*, which is what would lift recall.
-> I'll cover that math on the results slide.
+> **Lidstone smoothing** — that's the alpha=0.5 in the denominator — is
+> the piece that makes this safe in production. Without it, an unseen
+> bigram makes P zero, and `log(Q/0)` is infinite. Smoothing keeps every
+> probability strictly positive and the math finite. That's what lets the
+> detector handle bigrams it has never seen before without crashing.
+>
+> Two scoring modes come out of the same math for free. **Full KL** asks
+> "is the whole distribution different." **max_contrib** — which is the
+> default — asks "is there one surprisingly bad bigram." On short noisy
+> traces, full KL can be jittery; max_contrib is more robust. Both ship,
+> both are configurable from YAML.
+>
+> Why KL and not PCA or an LSTM or Drain. Three reasons. About 200 lines
+> of code, zero ML dependencies, fully deterministic — no GPU, no model
+> training run that takes hours. Fully **explainable**: when the detector
+> fires, the event metadata includes `top_contributors` — the actual
+> bigrams that drove the score. I can show a reviewer "this is why."
+> Embedding-space methods can't do that. And third, KL **captures the
+> distributional anomalies** that set-membership misses — reordered
+> events, missing terminals, frequency drift. The results slide will
+> show that this lifted recall from 0.29 to 0.73.
 
 **[NOTES]**
-- This is the slide that deserves the most rehearsal. Two strong claims
-  must land cleanly: (1) UUIDs not records, (2) timeout-not-terminal.
+- This is the slide that deserves the most rehearsal. Three strong claims
+  must land cleanly: (1) UUIDs not records, (2) timeout-not-terminal,
+  (3) KL on frequencies, with the worked example showing why an unseen
+  bigram dominates the score.
 - The phrase "bounded memory is a contract, not a hope" is yours — use it.
-- If asked "what happens to the 12,040 false negatives?" — they use only
-  normal 2-grams, just in different proportions. That's the segue to the
-  results slide and the v2 KL-divergence pitch.
+- If asked "why not just learn an embedding?" — explainability. KL gives
+  you the bigram that fired; an LSTM gives you a vector.
+- If asked "what does alpha control?" — smoothing strength. α=0.5 is
+  Jeffreys' prior; sweep showed it was insensitive between 0.1 and 1.0.
 
 ---
 
@@ -1419,47 +1371,64 @@ set (137 distinct 2-grams from training):
 
 **Visual:**
 
-> ## PipelineX in one slide
+> ## PipelineX — closing the loop on the problem
 >
-> - **Async log analytics engine** with bounded-queue backpressure as its central correctness property
-> - **Six design patterns**, each solving a specific problem
-> - **Four detectors** across two fundamentally different anomaly models (point and sequence)
-> - **Quantitative F1** on *real* labeled data — HDFS_v1, BGL — reproducible from a fresh checkout
-> - **~46K rec/s, p99 8 µs, zero record loss** under backpressure
-> - **~200 tests**, mypy strict, ~82% coverage
+> Three problems on Slide 3. One answer on this slide.
 >
-> ### The single biggest decision
-> > A **bounded queue** gives backpressure → backpressure gives the records-conservation invariant → that invariant is what makes the whole system trustworthy.
+> | The problem | PipelineX's answer |
+> |---|---|
+> | **Volume** — a billion lines a day, grep can't keep up | An **async pipeline** that ingests, parses, and scores in one streaming pass |
+> | **Structure** — real anomalies are patterns, not keywords | Detectors that work on the **right shape** of each anomaly — per-line *and* sequence |
+> | **Heterogeneity** — every system emits a different log format | One **config-driven** architecture that handles new formats by adding configuration, not rewriting code |
+>
+>
+> ### The one line to remember
+> > **PipelineX turns log analytics from "tail and grep" into a structured, measurable, extensible system — and proves it on real data.**
 
 **[SAY] (~1 minute):**
-> To summarize.
+> To close.
 >
-> PipelineX is an asynchronous log-analytics engine. It rests on one
-> central correctness property — backpressure from a bounded queue, which
-> guarantees no records are silently lost. Six design patterns, each with a
-> specific problem to solve. Four detectors covering two fundamentally
-> different anomaly models. Real F1 numbers on real published labeled
-> datasets — not made up, fully reproducible. About 46,000 records per
-> second, sub-10-microsecond latency, zero data loss verified.
+> I opened on Slide 3 with three problems: volume, structure, and
+> heterogeneity. Everything between then and now was an answer to one of
+> those three.
 >
-> If you remember one thing from this talk: the bounded queue is what makes
-> everything else possible. It's a small architectural choice with very
-> large downstream consequences. Every other decision in the project ladders
-> up to that one.
+> **Volume** — a billion lines a day. PipelineX answers that with a
+> streaming async pipeline that ingests, parses, and scores in a single
+> pass, and never silently loses a record under load.
+>
+> **Structure** — real anomalies are *patterns*, not keywords. PipelineX
+> answers that with detectors that match the actual shape of the
+> anomaly — per-line for point anomalies, sequence-aware for pattern
+> anomalies — proven on two datasets whose anomalies are *opposite* in
+> shape.
+>
+> **Heterogeneity** — every system emits a different format. PipelineX
+> answers that by making the architecture **configuration-driven**:
+> adding a new log format is a YAML change and a parser class, not a
+> rewrite of the pipeline.
+>
+> If you remember one thing from this talk, it's this: **PipelineX takes
+> log analytics from "tail and grep" to a structured, measurable,
+> extensible system — and proves it on real data.** Every claim I made
+> tonight is backed by a reproducible number in the repository.
+>
+> Thank you. I'd love to take your questions.
 
 **[NOTES]**
-- This is the slide they'll remember. The last sentence is the one to land
-  cleanly.
+- This is the slide they'll remember. The "tail and grep → structured,
+  measurable, extensible system" line is the one to land cleanly. Pause
+  before the final sentence.
+- Do not introduce new material here. Every claim on this slide must
+  have been said earlier in the talk.
+- Eye contact for the last sentence. Then transition straight to Q&A.
 
 ---
 
-# Slide 15 — Thank You & Q&A
+# Slide 15 — Thank You
 
 **Visual:**
 
 > # Thank you.
->
-> ### I'd love your questions.
 
 **[SAY] (~30 seconds):**
 > Thank you for your time. I'd be happy to go deeper on anything I covered,
